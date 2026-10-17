@@ -110,11 +110,15 @@ gen_uuid() {
 }
 
 # 生成 REALITY x25519 密钥对, 输出 "私钥 公钥"
+# 兼容不同版本 xray 输出: "Private key: xxx"/"PrivateKey: xxx"; 公钥行可能是 "Public key:" 或 "Password (PublicKey):"
 gen_x25519() {
+    local xray_bin
+    xray_bin="$(command -v xray 2>/dev/null || echo /usr/local/bin/xray)"
+    [[ -x "${xray_bin}" ]] || return 1
     local out
-    out="$(/usr/local/bin/xray x25519 2>/dev/null || xray x25519 2>/dev/null)" || return 1
-    X25519_PRIVKEY="$(echo "${out}" | awk '/Private key/{print $3}')"
-    X25519_PUBKEY="$(echo "${out}" | awk '/Public key/{print $3}')"
+    out="$("${xray_bin}" x25519 2>/dev/null)" || return 1
+    X25519_PRIVKEY="$(echo "${out}" | awk -F': *' '/[Pp]rivate/{print $2; exit}')"
+    X25519_PUBKEY="$(echo "${out}" | awk -F': *' '/[Pp]ublic|Password/{print $2; exit}')"
     [[ -n "${X25519_PRIVKEY}" && -n "${X25519_PUBKEY}" ]]
 }
 
@@ -338,14 +342,39 @@ check_domain() {
 ensure_v2ray() {
     if command -v v2ray >/dev/null 2>&1 && [[ -x /usr/local/bin/v2ray ]]; then
         log_info "V2Ray 已安装: $(/usr/local/bin/v2ray version 2>/dev/null | head -1)"
-        return
-    fi
-    log_info "安装/更新 V2Ray core (v2fly 官方脚本)..."
-    if ! bash <(curl -L -s "${V2RAY_INSTALL_SCRIPT}"); then
-        log_error "V2Ray 安装失败,请检查网络。"
-        exit 1
+    else
+        log_info "安装/更新 V2Ray core (v2fly 官方脚本)..."
+        if ! bash <(curl -L -s "${V2RAY_INSTALL_SCRIPT}"); then
+            log_error "V2Ray 安装失败,请检查网络。"
+            exit 1
+        fi
     fi
     mkdir -p "${V2RAY_CONF_DIR}"
+    ensure_geo_data
+}
+
+# 路由规则 geoip:private 依赖 geoip.dat;官方安装脚本可能不带,缺失时补齐
+ensure_geo_data() {
+    local geo_dir="/usr/local/share/v2ray"
+    if [[ -s "${geo_dir}/geoip.dat" && -s "${geo_dir}/geosite.dat" ]]; then
+        return
+    fi
+    mkdir -p "${geo_dir}"
+    log_info "下载 geo 数据文件 (geoip.dat / geosite.dat)..."
+    if [[ ! -s "${geo_dir}/geoip.dat" ]]; then
+        curl -sL --max-time 120 -o "${geo_dir}/geoip.dat" \
+            "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat" || true
+    fi
+    if [[ ! -s "${geo_dir}/geosite.dat" ]]; then
+        # v2fly 官方 domain-list-community 的 latest 资产可能 404, 备选 Loyalsoldier 源
+        curl -sL --max-time 120 -o "${geo_dir}/geosite.dat" \
+            "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" || true
+    fi
+    if [[ -s "${geo_dir}/geoip.dat" && -s "${geo_dir}/geosite.dat" ]]; then
+        log_info "geo 数据就绪。"
+    else
+        log_warn "geo 数据下载失败,若服务启动报 geoip 缺失,请手动下载到 ${geo_dir}/"
+    fi
 }
 
 ensure_xray() {
@@ -458,6 +487,13 @@ EOF
         nginx_check_reload || true
     fi
 
+    # 若存在旧证书, 先备份; 签发失败时回滚, 避免无效内容导致 nginx 无法加载证书
+    local cert_backup=""
+    if [[ -f "${CRT_FILE}" ]]; then
+        cert_backup="${CRT_FILE}.bak.$$"
+        cp -a "${CRT_FILE}" "${cert_backup}"
+    fi
+
     log_info "使用 HTTP 验证方式申请 Let's Encrypt 证书 (域名: ${DOMAIN})..."
     if /root/.acme.sh/acme.sh --issue -d "${DOMAIN}" -w "${WS_WWW_ROOT}" --server letsencrypt --log; then
         /root/.acme.sh/acme.sh --install-cert -d "${DOMAIN}" \
@@ -465,8 +501,16 @@ EOF
             --key-file "${KEY_FILE}" \
             --reloadcmd "bash -c '${NGINX_BIN} -s reload 2>/dev/null; systemctl reload nginx 2>/dev/null; systemctl restart ${WS_SERVICE} ${H2_SERVICE} 2>/dev/null; exit 0'"
         log_info "证书申请并安装成功: ${CRT_FILE}"
+        [[ -n "${cert_backup}" ]] && rm -f "${cert_backup}"
     else
         log_warn "证书自动申请失败(常见原因: 域名未解析到本机 / 80 端口被占用或封禁 / 被防火墙拦截)。"
+        # 回滚: 不让 acme.sh 的失败安装污染证书文件, 保证 nginx 仍能加载
+        if [[ -n "${cert_backup}" ]]; then
+            mv -f "${cert_backup}" "${CRT_FILE}"
+            log_info "已保留原有证书文件 ${CRT_FILE}。"
+        else
+            rm -f "${CRT_FILE}" "${KEY_FILE}"
+        fi
         log_confirm "可稍后手动申请: ${SSL_UPDATE_SH}"
         log_confirm "或自行将证书放到 ${CRT_FILE} 与 ${KEY_FILE} 后,重跑本脚本。"
     fi
@@ -616,11 +660,21 @@ write_ws_nginx_config() {
 }"
     fi
 
+    # http2 指令: nginx >= 1.25.1 用 "http2 on", 旧版用 "listen ... http2"
+    local http2_line1="listen 443 ssl http2;"
+    local http2_line2="listen [::]:443 ssl http2;"
+    if "${NGINX_BIN}" -v 2>&1 | grep -qE "nginx/(1\.2[5-9]|1\.[3-9][0-9]|[2-9]\.)" \
+        || "${NGINX_BIN}" -v 2>&1 | grep -qE "nginx/1\.25\.[1-9]"; then
+        http2_line1="listen 443 ssl;"
+        http2_line2="listen [::]:443;
+    http2 on;"
+    fi
+
     cat > "${WS_NGINX_CONF}" <<EOF
 ${http_block}
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    ${http2_line1}
+    ${http2_line2}
     server_name ${DOMAIN};
 
     ssl_certificate     ${CRT_FILE};
@@ -1004,8 +1058,13 @@ do_install_reality() {
     ensure_xray
 
     # 端口: 443 空闲则用 443 (最优), 否则分配随机端口 (可与 ws 共存)
-    if ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE '[:.]443$' \
-        || [[ -f "${V2RAY_CONF_DIR}/used_ports.txt" ]] && grep -qw 443 "${V2RAY_CONF_DIR}/used_ports.txt" 2>/dev/null; then
+    # 注意: ss 检测必须独占判断, 不能与其他条件混合 (&&/|| 优先级坑)
+    local port443_busy=0
+    ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE '[:.]443$' && port443_busy=1
+    if [[ -f "${V2RAY_CONF_DIR}/used_ports.txt" ]] && grep -qw 443 "${V2RAY_CONF_DIR}/used_ports.txt" 2>/dev/null; then
+        port443_busy=1
+    fi
+    if [[ "${port443_busy}" == "1" ]]; then
         REALITY_PORT="$(gen_port "${V2RAY_CONF_DIR}/used_ports.txt")"
         log_info "443 端口已被占用 (如 ws 模式的 Nginx),REALITY 使用独立端口 ${REALITY_PORT}。"
     else
@@ -1039,7 +1098,8 @@ do_install_reality() {
         exit 1
     fi
     REALITY_PUBKEY="${X25519_PUBKEY}"
-    REALITY_SID="$(gen_random 8)"
+    # shortId 必须是 0-16 位的偶数长度十六进制字符串
+    REALITY_SID="$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
     UUID="$(gen_uuid)"
     CLIENT_REMARK="${REALITY_SNI}-reality"
