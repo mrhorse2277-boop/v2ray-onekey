@@ -197,23 +197,43 @@ install_dependencies() {
         apt-get update -y
         apt-get install -y curl wget socat qrencode openssl cron ca-certificates
         systemctl enable --now cron >/dev/null 2>&1 || systemctl enable --now crond >/dev/null 2>&1
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y epel-release >/dev/null 2>&1
-        yum install -y curl wget socat qrencode openssl cronie
-        systemctl enable --now crond >/dev/null 2>&1
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl wget socat qrencode openssl cronie
+        # Rocky/Alma/Fedora: qrencode 在 EPEL (部分镜像已内置)
+        dnf install -y epel-release >/dev/null 2>&1 || true
+        dnf install -y curl wget socat qrencode openssl cronie || true
+        command -v qrencode >/dev/null 2>&1 || dnf install -y qrencode >/dev/null 2>&1 || true
+        systemctl enable --now crond >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        # CentOS 7 (EOL): 若官方源已归档失败, 不阻断; qrencode 在 EPEL
+        yum install -y epel-release >/dev/null 2>&1 || true
+        yum install -y curl wget socat openssl cronie || true
+        yum install -y qrencode >/dev/null 2>&1 || true
         systemctl enable --now crond >/dev/null 2>&1
     else
-        log_error "未找到 apt-get / yum / dnf,无法自动安装依赖。"
+        log_error "未找到 apt-get / dnf / yum,无法自动安装依赖。"
         exit 1
     fi
 
-    # CentOS 系列开启 SELinux 放行 Nginx / V2Ray 反代本地端口
+    # 缺失项降级处理: 核心依赖必须存在, 次要依赖缺失仅告警
+    local missing_core=""
+    for c in curl wget openssl; do
+        command -v "${c}" >/dev/null 2>&1 || missing_core+="${c} "
+    done
+    if [[ -n "${missing_core}" ]]; then
+        log_error "核心依赖安装失败: ${missing_core},请手动安装后重试。"
+        exit 1
+    fi
+    command -v qrencode >/dev/null 2>&1 || log_warn "qrencode 不可用,安装完成后不显示二维码(分享链接功能不受影响)。"
+
+    # SELinux Enforcing (RHEL 系默认): 放行 nginx 反代本地端口
     if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
         if command -v setsebool >/dev/null 2>&1; then
             setsebool -P httpd_can_network_connect 1 || true
         fi
+        # h2/REALITY 由 v2ray/xray 直接绑定非保留端口, 上游 systemd 单元含
+        # CAP_NET_BIND_SERVICE 时 443 也可绑定; /data 下证书读取一般不受限。
+        # 极端情况下若服务启动被 AVC 拒绝, 提示用户用 audit2allow 处理
+        log_info "SELinux 为 Enforcing,已放行 httpd_can_network_connect。若服务启动异常,请检查 audit 日志 (ausearch -m avc -ts recent)。"
     fi
 }
 
@@ -283,15 +303,17 @@ open_firewall() {
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw allow 80/tcp >/dev/null 2>&1
         ufw allow 443/tcp >/dev/null 2>&1
-        [[ -n "${H2_PORT}" ]]    && ufw allow "${H2_PORT}/tcp"    >/dev/null 2>&1
-        [[ -n "${SOCKS_PORT}" ]] && ufw allow "${SOCKS_PORT}/tcp" >/dev/null 2>&1
+        [[ -n "${H2_PORT}" ]]      && ufw allow "${H2_PORT}/tcp"      >/dev/null 2>&1
+        [[ -n "${SOCKS_PORT}" ]]   && ufw allow "${SOCKS_PORT}/tcp"   >/dev/null 2>&1
+        [[ -n "${REALITY_PORT}" ]] && ufw allow "${REALITY_PORT}/tcp" >/dev/null 2>&1
         log_info "已通过 ufw 放行相关端口。"
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
         firewall-cmd --permanent --add-service=http  >/dev/null 2>&1
         firewall-cmd --permanent --add-service=https >/dev/null 2>&1
-        [[ -n "${H2_PORT}" ]]    && firewall-cmd --permanent --add-port="${H2_PORT}/tcp"    >/dev/null 2>&1
-        [[ -n "${SOCKS_PORT}" ]] && firewall-cmd --permanent --add-port="${SOCKS_PORT}/tcp" >/dev/null 2>&1
+        [[ -n "${H2_PORT}" ]]      && firewall-cmd --permanent --add-port="${H2_PORT}/tcp"      >/dev/null 2>&1
+        [[ -n "${SOCKS_PORT}" ]]   && firewall-cmd --permanent --add-port="${SOCKS_PORT}/tcp"   >/dev/null 2>&1
+        [[ -n "${REALITY_PORT}" ]] && firewall-cmd --permanent --add-port="${REALITY_PORT}/tcp" >/dev/null 2>&1
         firewall-cmd --reload >/dev/null 2>&1
         log_info "已通过 firewalld 放行相关端口。"
     fi
@@ -316,6 +338,14 @@ check_domain() {
         resolved="$(getent hosts "${domain}" 2>/dev/null | awk '{print $1; exit}')"
     fi
     if [[ -z "${resolved}" ]]; then
+        # 备选: python3 (RHEL 最小安装无 nslookup/dig, 但常有 python3)
+        if command -v python3 >/dev/null 2>&1; then
+            resolved="$(python3 -c "import socket,sys
+try: print(socket.gethostbyname(sys.argv[1]))
+except Exception: pass" "${domain}" 2>/dev/null)"
+        fi
+    fi
+    if [[ -z "${resolved}" ]] && command -v nslookup >/dev/null 2>&1; then
         resolved="$(nslookup "${domain}" 2>/dev/null | awk '/^Address/ && !/127.0.0.1|#/{print $2; exit}')"
     fi
     if [[ -z "${resolved}" ]]; then
