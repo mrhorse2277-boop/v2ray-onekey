@@ -1375,14 +1375,60 @@ do_install_reality() {
         fi
     fi
 
-    # 部署前终验: 选定/自定义的站再即时校验一次 (防探测与选择之间的状态变化), 不达标则退出
-    log_info "部署前终验目标站 ${REALITY_DEST} ..."
-    if ! check_reality_dest "${REALITY_DEST}" "${REALITY_SNI}"; then
-        log_error "目标站 ${REALITY_DEST} 部署前校验未通过 (状态已变化), 本次安装中止。"
-        log_confirm "请重新运行安装并选择其他目标站。"
-        exit 1
+    # 部署前终验: 选定/自定义的站再即时校验一次 (防探测与选择之间的状态变化)
+    # 校验不通过时回退重选 (交互模式) 或自动换下一候选 (非交互), 全部失败才中止;
+    # env 明确指定的站不通过则直接退出 (尊重用户明确意图, 不静默替换)
+    if [[ -z "${REALITY_DEST_REALIZED:-}" ]]; then
+        # 候选来自探测池 (交互选择或自动选站): 校验失败可回退重选
+        while :; do
+            log_info "部署前终验目标站 ${REALITY_DEST} ..."
+            if check_reality_dest "${REALITY_DEST}" "${REALITY_SNI}"; then
+                log_info "  -> 终验通过,开始部署。"
+                break
+            fi
+            log_error "  -> 目标站 ${REALITY_DEST} 部署前校验未通过 (状态已变化)。"
+            # 非交互模式: 从 ok_dests 中剔除失败项, 自动换下一个
+            if [[ ! -t 0 && ${#ok_dests[@]} > 0 ]]; then
+                local remain=() od
+                for od in "${ok_dests[@]}"; do
+                    [[ "${od%%|*}" == "${REALITY_DEST}" ]] || remain+=("${od}")
+                done
+                ok_dests=("${remain[@]}")
+                if (( ${#ok_dests[@]} > 0 )); then
+                    REALITY_DEST="${ok_dests[0]%%|*}"
+                    REALITY_SNI="${REALITY_DEST%%:*}"
+                    log_info "自动切换到下一候选 ${REALITY_DEST} (${ok_dests[0]##*|}ms), 重新终验..."
+                    continue
+                fi
+                log_error "所有候选均未通过终验,本次安装中止。"
+                exit 1
+            fi
+            # 交互模式: 回退重选
+            if (( ${#ok_dests[@]} > 0 )); then
+                # 把失败项从候选中剔除后再进选择菜单
+                local remain2=() od2
+                for od2 in "${ok_dests[@]}"; do
+                    [[ "${od2%%|*}" == "${REALITY_DEST}" ]] || remain2+=("${od2}")
+                done
+                ok_dests=("${remain2[@]}")
+            fi
+            if (( ${#ok_dests[@]} == 0 )); then
+                log_error "候选已全部尝试完毕且均未通过,本次安装中止。"
+                exit 1
+            fi
+            log_confirm "请重新选择目标站:"
+            select_reality_dest_interactive ok_dests || exit 1
+        done
+    else
+        # env 明确指定: 不通过直接退出, 不静默替换
+        log_info "部署前终验目标站 ${REALITY_DEST} (环境变量指定) ..."
+        if ! check_reality_dest "${REALITY_DEST}" "${REALITY_SNI}"; then
+            log_error "目标站 ${REALITY_DEST} 部署前校验未通过,本次安装中止。"
+            log_confirm "可更换 REALITY_DEST 后重试,或不带环境变量运行以启用自动探测选站。"
+            exit 1
+        fi
+        log_info "  -> 终验通过,开始部署。"
     fi
-    log_info "  -> 终验通过,开始部署。"
 
     # 密钥对与 shortId
     if ! gen_x25519; then
