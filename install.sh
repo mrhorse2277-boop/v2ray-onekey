@@ -1086,6 +1086,68 @@ do_install_socks() {
 
 REALITY_DEFAULT_DESTS=("www.tesla.com:443" "www.microsoft.com:443" "www.samsung.com:443" "www.lovelive-anime.jp:443" "www.nvidia.com:443")
 
+# REALITY 目标站交互选择:
+#   1..N  从探测通过的候选站中挑选
+#   c     自定义输入任意域名:port (校验 TLS1.3/H2 达标才接受, 不达标可重输)
+#   直接回车 = 默认第一个可用候选
+# 参数: $1 = 可用候选数组名 (nameref)
+select_reality_dest_interactive() {
+    local -n _ok="$1"
+    echo
+    echo "请选择 REALITY 伪装目标站 (探测通过 $((${#_ok[@]})) 个):"
+    local i
+    for (( i=0; i<${#_ok[@]}; i++ )); do
+        echo "  $((i+1)). ${_ok[$i]}"
+    done
+    echo "  c. 自定义其他域名 (自动校验 TLS1.3/H2, 达标才接受)"
+    echo
+    echo "提示: 优先选与 VPS 同地区、你平时常访问的大站, 伪装更自然。"
+    while :; do
+        read -rp "请输入编号 / c / 直接回车默认 [${_ok[0]}]: " pick || return 1
+        case "${pick}" in
+            "")
+                REALITY_DEST="${_ok[0]}"
+                REALITY_SNI="${REALITY_DEST%%:*}"
+                log_info "已选择默认目标站 ${REALITY_DEST}"
+                return 0
+                ;;
+            c|C)
+                local custom ok=0
+                while :; do
+                    read -rp "输入自定义目标站 (格式 域名:端口, 如 www.example.com:443): " custom || return 1
+                    custom="${custom//[$'\r\n']/}"
+                    custom="${custom,,}"
+                    if ! echo "${custom}" | grep -Eq '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+:[0-9]+$'; then
+                        log_error "格式不对,应为 域名:端口 (如 www.example.com:443)"
+                        continue
+                    fi
+                    local cs="${custom%%:*}"
+                    log_info "校验 ${custom} ..."
+                    if check_reality_dest "${custom}" "${cs}"; then
+                        log_info "  -> 校验通过,使用 ${custom}"
+                        REALITY_DEST="${custom}"
+                        REALITY_SNI="${cs}"
+                        ok=1
+                        break
+                    else
+                        log_error "  -> 校验未通过 (需支持 TLS 1.3 + H2, 且本机可达), 请换一个域名或重试。"
+                    fi
+                done
+                [[ "${ok}" == "1" ]] && return 0
+                ;;
+            *)
+                if [[ "${pick}" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#_ok[@]} )); then
+                    REALITY_DEST="${_ok[$((pick-1))]}"
+                    REALITY_SNI="${REALITY_DEST%%:*}"
+                    log_info "已选择目标站 ${REALITY_DEST}"
+                    return 0
+                fi
+                log_error "无效输入,请重试。"
+                ;;
+        esac
+    done
+}
+
 do_install_reality() {
     ensure_xray
 
@@ -1105,24 +1167,35 @@ do_install_reality() {
     fi
     record_port "${REALITY_PORT}"
 
-    # 选择伪装目标站 (自动校验 TLS1.3/H2, 失败则换下一个)
-    local idx=0
-    while :; do
-        REALITY_DEST="${REALITY_DEFAULT_DESTS[$((idx % ${#REALITY_DEFAULT_DESTS[@]}))]}"
-        REALITY_SNI="${REALITY_DEST%%:*}"
-        log_info "校验伪装目标站 ${REALITY_DEST} ..."
-        if check_reality_dest "${REALITY_DEST}" "${REALITY_SNI}"; then
-            log_info "目标站 ${REALITY_DEST} 可用。"
-            break
-        fi
-        idx=$((idx + 1))
-        if (( idx >= ${#REALITY_DEFAULT_DESTS[@]} )); then
-            log_warn "所有预置目标站校验均未通过,使用 ${REALITY_DEFAULT_DESTS[0]} (若后续连接异常请手动更换 dest/sni)。"
-            REALITY_DEST="${REALITY_DEFAULT_DESTS[0]}"
-            REALITY_SNI="${REALITY_DEST%%:*}"
-            break
+    # 探测候选池, 生成"可用目标站列表"
+    local ok_dests=()
+    local d
+    for d in "${REALITY_DEFAULT_DESTS[@]}"; do
+        local s="${d%%:*}"
+        log_info "校验伪装目标站 ${d} ..."
+        if check_reality_dest "${d}" "${s}"; then
+            log_info "  -> 可用"
+            ok_dests+=("${d}")
+        else
+            log_info "  -> 不可用,跳过"
         fi
     done
+
+    # 目标站选择: 交互模式列出可用候选让用户挑, 或自定义任意域名 (校验达标才接受);
+    # 非交互模式 (stdin 非终端) 自动选第一个通过的候选
+    if [[ -t 0 ]]; then
+        select_reality_dest_interactive ok_dests
+    else
+        if (( ${#ok_dests[@]} > 0 )); then
+            REALITY_DEST="${ok_dests[0]}"
+            REALITY_SNI="${REALITY_DEST%%:*}"
+            log_info "非交互模式,自动选用 ${REALITY_DEST}"
+        else
+            log_warn "所有预置目标站校验均未通过,使用 ${REALITY_DEFAULT_DESTS[0]} 兜底 (若后续连接异常请手动更换 dest/sni)。"
+            REALITY_DEST="${REALITY_DEFAULT_DESTS[0]}"
+            REALITY_SNI="${REALITY_DEST%%:*}"
+        fi
+    fi
 
     # 密钥对与 shortId
     if ! gen_x25519; then
