@@ -1841,7 +1841,22 @@ do_show_info() {
                 echo -e "${GREEN}--- ${section} ---${PLAIN}"
                 ;;
             share_url=*) url="${line#share_url=}" ;;
-            domain=*|port=*|uuid=*|socks_user=*|socks_pass=*|path=*|address=*|dest=*|sni=*)
+            socks_user=*) socks_user="${line#*=}"; printf ' %-9s: %s
+' "socks_user" "${socks_user}" ;;
+            socks_pass=*)
+                socks_pass="${line#*=}"
+                printf ' %-9s: %s
+' "socks_pass" "${socks_pass}"
+                ;;
+            domain=*)
+                socks_user=""; socks_pass=""; socks_port=""
+                printf ' %-9s: %s
+' "domain" "${line#*=}" ;;
+            port=*)
+                socks_port="${line#*=}"
+                printf ' %-9s: %s
+' "port" "${socks_port}" ;;
+            uuid=*|path=*|address=*|dest=*|sni=*)
                 local _k="${line%%=*}" _v="${line#*=}"
                 printf ' %-9s: %s
 ' "${_k}" "${_v}"
@@ -1851,6 +1866,12 @@ do_show_info() {
     if [[ -n "${url}" ]]; then
         echo -e " 分享链接: ${url}"
         echo "${url}" >> "${URL_FILE}"
+        if [[ -n "${socks_user:-}" && -n "${socks_pass:-}" && "${url}" == socks://* ]]; then
+            get_public_ip
+            local plain="${PUBLIC_IP}:${socks_port:-}:${socks_user}:${socks_pass}{socks5-${PUBLIC_IP}}"
+            echo -e " 工具格式: ${plain}"
+            echo "${plain}" >> "${URL_FILE}"
+        fi
     fi
     echo -e "${GREEN}=============================================${PLAIN}"
     log_confirm "全部分享链接已导出到: ${URL_FILE}"
