@@ -1842,11 +1842,9 @@ do_show_info() {
                 ;;
             share_url=*) url="${line#share_url=}" ;;
             domain=*|port=*|uuid=*|socks_user=*|socks_pass=*|path=*|address=*|dest=*|sni=*)
-                if [[ "${line}" == socks_pass=* ]]; then
-                    echo -e " ${line%%=*}     : ${line#*=}"
-                else
-                    echo -e " ${line%%=*}"$([[ "${#line%%=*}" -lt 10 ]] && printf '%*s' $((10 - ${#line%%=*})) "")": ${line#*=}"
-                fi
+                local _k="${line%%=*}" _v="${line#*=}"
+                printf ' %-9s: %s
+' "${_k}" "${_v}"
                 ;;
         esac
     done < "${INFO_FILE}"
