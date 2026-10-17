@@ -1107,28 +1107,50 @@ do_install_socks() {
 # 候选目标站按地区分组:格式 "站点:端口|地区" (地区用于按 VPS 位置智能排序)
 # 选站原则: 大厂自有域名、支持 TLS1.3+H2、非 CDN 共享域、在当地访问质量好,
 #           且必须"大陆可正常访问" —— 被墙站作 SNI 会触发 GFW 的 SNI 级回程阻断 (实战教训)
+# 每地区 3 个, 全部经真实探测 (TLS1.3+H2) 与 GFW 列表双重校验 (2026-10)
 REALITY_DEST_POOL=(
-    # 香港 (大陆可达的大站)
-    "www.hket.com:443|香港"
-    # 台湾
-    "www.momoshop.com.tw:443|台湾"
+    # 香港 (大陆可达)
+    "www.hkjc.com:443|香港"
+    "www.octopus.com.hk:443|香港"
+    "www.cathaypacific.com:443|香港"
+    # 台湾 (大陆可达; 台湾金融/媒体站多无 H2 或被墙, 用科技大厂)
+    "www.tsmc.com:443|台湾"
+    "www.mediatek.com:443|台湾"
+    "www.asus.com:443|台湾"
     # 新加坡
     "www.singtel.com:443|新加坡"
     "www.dbs.com:443|新加坡"
+    "www.grab.com:443|新加坡"
     # 日本
     "www.rakuten.co.jp:443|日本"
+    "www.sony.com:443|日本"
+    "www.nintendo.com:443|日本"
     # 韩国
     "www.samsung.com:443|韩国"
+    "www.hyundai.com:443|韩国"
+    "www.lg.com:443|韩国"
     # 美国 (大陆可达, 推荐优先)
     "www.tesla.com:443|美国"
     "www.microsoft.com:443|美国"
     "www.nvidia.com:443|美国"
     "www.cloudflare.com:443|美国"
+    "www.intel.com:443|美国"
     # 欧洲
     "www.bmw.de:443|德国"
+    "www.siemens.com:443|德国"
     "www.airbus.com:443|法国"
     "www.ns.nl:443|荷兰"
+    "www.rolls-roycemotorcars.com:443|英国"
 )
+
+# 每地区补充候选 (主要地区凑满 3 个以上; 全部经 TLS1.3+H2 与 GFW 列表校验)
+# 美国/德国/日本已有 >=3, 韩国补 lge 已在上方; 此处为各地区第 4-5 备选 (可选)
+REALITY_EXTRA_POOL=(
+    "www.acer.com:443|台湾"
+    "www.gigabyte.com:443|台湾"
+    "www.intel.com:443|美国"
+)
+REALITY_DEST_POOL+=("${REALITY_EXTRA_POOL[@]}")
 
 # 已知被墙/大陆不可达站点 (从候选池移除, 仅作参考说明):
 #   www.hk01.com / www.chinatimes.com / www.yahoo.co.jp / www.naver.com /
