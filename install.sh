@@ -499,6 +499,18 @@ install_acme() {
         exit 1
     fi
     /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
+    # 显式确保自动续签 cron 存在 (acme.sh 安装时通常会自装, 但 cron 环境缺失的
+    # 最小系统上可能失败; 各发行版 crontab 命令名不同, 做兼容)
+    if ! crontab -l 2>/dev/null | grep -q "acme.sh"; then
+        if command -v crontab >/dev/null 2>&1; then
+            (crontab -l 2>/dev/null; echo '0 3 * * * "/root/.acme.sh"/acme.sh --cron --home "/root/.acme.sh" > /dev/null') | crontab - 2>/dev/null                 && log_info "已配置 acme.sh 自动续签 cron (每天 03:00 检查)。"
+        elif [[ -d /etc/cron.d ]]; then
+            echo '0 3 * * * root "/root/.acme.sh"/acme.sh --cron --home "/root/.acme.sh" > /dev/null' > /etc/cron.d/acme-renew
+            log_info "已配置 /etc/cron.d/acme-renew 自动续签。"
+        else
+            log_warn "系统无 cron,自动续签不可用;请每 60 天手动运行菜单 8 或 ssl_update.sh。"
+        fi
+    fi
 }
 
 issue_certificate() {
