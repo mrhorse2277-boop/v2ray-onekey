@@ -1852,7 +1852,118 @@ do_uninstall() {
     log_info "卸载完成。"
 }
 
-# 仅更换 REALITY 伪装目标站: 保留 UUID/端口/密钥, 只改 dest+sni, 客户端只需更新 sni 字段
+# 从当前 REALITY 配置生成分享链接 (uuid/端口/sni/sid/私钥从 conf 提取, 公钥由私钥推导)
+build_reality_link_from_conf() {
+    local uuid sni sid pubkey ip
+    uuid="$(grep -o '"id": "[^"]*"' "${REALITY_CONF}" | head -1 | cut -d'"' -f4)"
+    sni="$(grep -A1 '"serverNames"' "${REALITY_CONF}" | grep -o '"[^"]*"' | sed -n 2p | tr -d '"')"
+    sid="$(grep -A1 '"shortIds"' "${REALITY_CONF}" | grep -o '"[0-9a-f]*"' | tr -d '"' | head -1)"
+    # 公钥必须与配置中的私钥配对 (密钥重置后旧 pbk 失效), 由私钥推导;
+    # 推导失败才回退沿用 URL_FILE 里的旧值 (此时提示可能不可用)
+    local privkey
+    privkey="$(grep -o '"privateKey": "[^"]*"' "${REALITY_CONF}" | cut -d'"' -f4)"
+    pubkey="$(xray x25519 -i "${privkey}" 2>/dev/null | awk '/Public key|Password/{print $NF}')"
+    if [[ -z "${pubkey}" ]]; then
+        pubkey="$(grep reality "${URL_FILE}" 2>/dev/null | tail -1 | grep -o 'pbk=[^&]*' | cut -d= -f2)"
+        log_warn "公钥推导失败,链接沿用旧 pbk (若刚更换过密钥则此链接不可用)。"
+    fi
+    local port
+    port="$(grep -o '"port": [0-9]*' "${REALITY_CONF}" | head -1 | grep -o '[0-9]*')"
+    ip="$(curl -4 -s --max-time 8 https://api.ip.sb/ip || curl -4 -s --max-time 8 https://api.ipify.org)"
+    ip="${ip//[$'\r\n']/}"
+    echo "vless://${uuid}@${ip}:${port}?type=tcp&security=reality&pbk=${pubkey}&sid=${sid}&sni=${sni}&fp=chrome&flow=xtls-rprx-vision&encryption=none#${sni}-reality"
+}
+
+# 重置 REALITY 节点要素 (端口/UUID/密钥/全部), 保留伪装站; 变更后输出新链接, 失败回滚
+do_reset_reality() {
+    check_root
+    if [[ ! -f "${REALITY_CONF}" || ! -f "/etc/systemd/system/${REALITY_SERVICE}.service" ]]; then
+        log_error "未安装 REALITY 模式,请先通过菜单 6 或 bash install.sh reality 安装。"
+        return
+    fi
+
+    echo "请选择要重置的项目:"
+    echo "  1. 仅更换端口     (旧端口释放, 自动分配新端口)"
+    echo "  2. 仅更换 UUID    (旧客户端立即失效)"
+    echo "  3. 仅更换密钥对   (pbk 变化, 节点身份重置)"
+    echo "  4. 全部重置       (端口+UUID+密钥)"
+    echo "  0. 取消"
+    read -rp "请选择: " choice || return
+
+    local reset_port=0 reset_uuid=0 reset_key=0
+    case "${choice}" in
+        1) reset_port=1 ;;
+        2) reset_uuid=1 ;;
+        3) reset_key=1 ;;
+        4) reset_port=1; reset_uuid=1; reset_key=1 ;;
+        *) return ;;
+    esac
+
+    # 备份当前配置 (回滚用)
+    cp "${REALITY_CONF}" "${REALITY_CONF}.bak"
+
+    local old_port
+    old_port="$(grep -o '"port": [0-9]*' "${REALITY_CONF}" | head -1 | grep -o '[0-9]*')"
+    local changed=()
+
+    if [[ "${reset_port}" == "1" ]]; then
+        local new_port
+        new_port="$(gen_port "${V2RAY_CONF_DIR}/used_ports.txt")"
+        sed -i "s/\"port\": ${old_port},/\"port\": ${new_port},/" "${REALITY_CONF}"
+        changed+=("端口 ${old_port} -> ${new_port}")
+        record_port "${new_port}"
+    fi
+    if [[ "${reset_uuid}" == "1" ]]; then
+        local old_uuid new_uuid
+        old_uuid="$(grep -o '"id": "[^"]*"' "${REALITY_CONF}" | head -1 | cut -d'"' -f4)"
+        new_uuid="$(gen_uuid)"
+        sed -i "s/\"id\": \"${old_uuid}\"/\"id\": \"${new_uuid}\"/" "${REALITY_CONF}"
+        changed+=("UUID 已更换")
+    fi
+    if [[ "${reset_key}" == "1" ]]; then
+        if ! gen_x25519; then
+            log_error "生成新密钥对失败,原配置未动。"
+            rm -f "${REALITY_CONF}.bak"
+            return 1
+        fi
+        sed -i "s|\"privateKey\": \"[^\"]*\"|\"privateKey\": \"${X25519_PRIVKEY}\"|" "${REALITY_CONF}"
+        changed+=("密钥对已更换 (新 pbk 见下方链接)")
+    fi
+
+    systemctl restart "${REALITY_SERVICE}"
+    sleep 1
+    if ! systemctl is-active --quiet "${REALITY_SERVICE}"; then
+        log_error "服务重启失败,回滚配置:"
+        mv "${REALITY_CONF}.bak" "${REALITY_CONF}"
+        systemctl restart "${REALITY_SERVICE}"
+        journalctl -u "${REALITY_SERVICE}" --no-pager -n 10
+        return 1
+    fi
+    rm -f "${REALITY_CONF}.bak"
+
+    # 端口变更时放行新端口
+    if [[ "${reset_port}" == "1" ]]; then
+        open_firewall
+    fi
+
+    local new_url
+    new_url="$(build_reality_link_from_conf)"
+    echo "${new_url}" >> "${URL_FILE}"
+
+    echo
+    echo -e "${GREEN}==========================================${PLAIN}"
+    echo -e "${GREEN}   REALITY 节点重置完成                   ${PLAIN}"
+    echo -e "${GREEN}==========================================${PLAIN}"
+    local c
+    for c in "${changed[@]}"; do
+        echo -e " - ${c}"
+    done
+    echo -e " 新链接   : ${new_url}"
+    echo -e "${GREEN}==========================================${PLAIN}"
+    log_confirm "客户端请删除旧节点并导入上面的新链接 (旧链接已失效)。"
+}
+
+
 do_change_reality_dest() {
     check_root
     if [[ ! -f "${REALITY_CONF}" || ! -f "/etc/systemd/system/${REALITY_SERVICE}.service" ]]; then
@@ -2019,7 +2130,8 @@ show_menu() {
     echo -e " 8. 手动续签 / 重新申请证书"
     echo -e " 9. 更新 V2Ray / Xray core"
     echo -e "10. 更换 REALITY 伪装站 (保留 UUID/端口, 客户端只改 SNI)"
-    echo -e "11. 卸载 (可选单模式或全部)"
+    echo -e "11. 重置 REALITY 节点 (端口 / UUID / 密钥 / 全部)"
+    echo -e "12. 卸载 (可选单模式或全部)"
     echo -e " 0. 退出"
     echo
     read -rp "请选择: " choice || exit 0
@@ -2034,7 +2146,8 @@ show_menu() {
         8) do_renew_cert ;;
         9) do_update_v2ray ;;
         10) do_change_reality_dest ;;
-        11) do_uninstall ;;
+        11) do_reset_reality ;;
+        12) do_uninstall ;;
         0) exit 0 ;;
         *) ;;
     esac
