@@ -85,6 +85,7 @@ WS_PATH=""
 SOCKS_PORT=""
 SOCKS_USER=""
 SOCKS_PASS=""
+WS_PORT=""
 REALITY_PORT=""
 # REALITY_DEST 允许环境变量预设 (REALITY_DEST="域名:端口" bash install.sh reality),
 # 因此这里不能无条件清空, 用 :- 兜底
@@ -288,6 +289,12 @@ detect_nginx_env() {
 
 # 校验/重载 Nginx (兼容宝塔与发行版)
 nginx_check_reload() {
+    # NGINX_BIN 未初始化时 (如重置节点先于 ws 安装被调用) 自动探测
+    if [[ -z "${NGINX_BIN}" ]]; then
+        NGINX_BIN="$(command -v nginx 2>/dev/null || echo /www/server/nginx/sbin/nginx)"
+        [[ -x "${NGINX_BIN}" ]] || { log_warn "未找到 nginx,跳过 reload。"; return 0; }
+        [[ "${NGINX_ENV}" == "none" ]] && NGINX_ENV="distro"
+    fi
     if ! "${NGINX_BIN}" -t >/dev/null 2>&1; then
         log_error "nginx 配置测试失败:"
         "${NGINX_BIN}" -t
@@ -1963,7 +1970,170 @@ do_reset_reality() {
     log_confirm "客户端请删除旧节点并导入上面的新链接 (旧链接已失效)。"
 }
 
+# 重置 ws/h2/socks 节点要素: 选模式 -> 选要素 -> 改配置重启 -> 失败回滚 -> 重建分享链接
+do_reset_node() {
+    check_root
+    echo "请选择要重置的节点模式:"
+    echo "  1. ws+tls   (v2ray-ws)"
+    echo "  2. h2+tls   (v2ray-h2)"
+    echo "  3. socks5   (v2ray-socks)"
+    echo "  0. 取消"
+    read -rp "请选择: " mode_pick || return
 
+    local conf svc svc_label port_var old_port new_port new_uuid new_user new_pass
+    local is_socks=0
+    case "${mode_pick}" in
+        1) conf="${WS_CONF}";   svc="${WS_SERVICE}";   svc_label="ws+tls" ;;
+        2) conf="${H2_CONF}";   svc="${H2_SERVICE}";   svc_label="h2+tls" ;;
+        3) conf="${SOCKS_CONF}"; svc="${SOCKS_SERVICE}"; svc_label="socks5"; is_socks=1 ;;
+        *) return ;;
+    esac
+    if [[ ! -f "${conf}" || ! -f "/etc/systemd/system/${svc}.service" ]]; then
+        log_error "未安装 ${svc_label} 模式,请先安装。"
+        return
+    fi
+
+    echo
+    if [[ "${is_socks}" == "1" ]]; then
+        echo "请选择要重置的项目:"
+        echo "  1. 仅更换端口"
+        echo "  2. 仅更换用户名/密码"
+        echo "  3. 端口 + 用户名/密码 全部重置"
+        echo "  0. 取消"
+        read -rp "请选择: " elem_pick || return
+        case "${elem_pick}" in
+            1) reset_port=1 ;;
+            2) reset_creds=1 ;;
+            3) reset_port=1; reset_creds=1 ;;
+            *) return ;;
+        esac
+    else
+        echo "请选择要重置的项目:"
+        echo "  1. 仅更换端口"
+        echo "  2. 仅更换 UUID"
+        echo "  3. 端口 + UUID 全部重置"
+        echo "  0. 取消"
+        read -rp "请选择: " elem_pick || return
+        case "${elem_pick}" in
+            1) reset_port=1 ;;
+            2) reset_uuid=1 ;;
+            3) reset_port=1; reset_uuid=1 ;;
+            *) return ;;
+        esac
+    fi
+
+    cp "${conf}" "${conf}.bak"
+    local changed=()
+
+    if [[ "${is_socks}" == "1" ]]; then
+        old_port="$(grep -o '"port": [0-9]*' "${conf}" | head -1 | grep -o '[0-9]*')"
+        if [[ "${reset_port:-0}" == "1" ]]; then
+            new_port="$(gen_port "${V2RAY_CONF_DIR}/used_ports.txt")"
+            sed -i "s/\"port\": ${old_port},/\"port\": ${new_port},/" "${conf}"
+            SOCKS_PORT="${new_port}"
+            changed+=("端口 ${old_port} -> ${new_port}")
+            record_port "${new_port}"
+        fi
+        if [[ "${reset_creds:-0}" == "1" ]]; then
+            new_user="$(gen_random 8)"
+            new_pass="$(gen_random 16)"
+            sed -i "s/\"user\": \"[^\"]*\"/\"user\": \"${new_user}\"/; s/\"pass\": \"[^\"]*\"/\"pass\": \"${new_pass}\"/" "${conf}"
+            SOCKS_USER="${new_user}"; SOCKS_PASS="${new_pass}"
+            changed+=("用户名/密码已更换: ${new_user} / ${new_pass}")
+        fi
+    else
+        old_port="$(grep -o '"port": [0-9]*' "${conf}" | head -1 | grep -o '[0-9]*')"
+        if [[ "${reset_port:-0}" == "1" ]]; then
+            new_port="$(gen_port "${V2RAY_CONF_DIR}/used_ports.txt")"
+            sed -i "s/\"port\": ${old_port},/\"port\": ${new_port},/" "${conf}"
+            if [[ "${mode_pick}" == "1" ]]; then
+                # ws 模式: 配置内部端口 + nginx 反代目标端口都要改
+                sed -i "s|proxy_pass http://127.0.0.1:${old_port};|proxy_pass http://127.0.0.1:${new_port};|" "${WS_NGINX_CONF}"
+                INTERNAL_PORT="${new_port}"
+                log_info "ws 模式: nginx 反代目标已同步更新为 ${new_port} (nginx 配置将一并 reload)。"
+            else
+                H2_PORT="${new_port}"
+                INTERNAL_PORT="${new_port}"
+            fi
+            changed+=("端口 ${old_port} -> ${new_port}")
+            record_port "${new_port}"
+        fi
+        if [[ "${reset_uuid:-0}" == "1" ]]; then
+            local old_uuid
+            old_uuid="$(grep -o '"id": "[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
+            new_uuid="$(gen_uuid)"
+            sed -i "s/\"id\": \"${old_uuid}\"/\"id\": \"${new_uuid}\"/" "${conf}"
+            UUID="${new_uuid}"
+            changed+=("UUID 已更换")
+        fi
+    fi
+
+    systemctl restart "${svc}"
+    if [[ "${mode_pick}" == "1" ]]; then
+        nginx_check_reload 2>/dev/null || true
+    fi
+    sleep 1
+    if ! systemctl is-active --quiet "${svc}"; then
+        log_error "服务重启失败,回滚配置:"
+        mv "${conf}.bak" "${conf}"
+        if [[ "${mode_pick}" == "1" && "${reset_port:-0}" == "1" ]]; then
+            sed -i "s|proxy_pass http://127.0.0.1:${new_port};|proxy_pass http://127.0.0.1:${old_port};|" "${WS_NGINX_CONF}"
+        fi
+        systemctl restart "${svc}"
+        journalctl -u "${svc}" --no-pager -n 10
+        return 1
+    fi
+    rm -f "${conf}.bak"
+
+    if [[ "${reset_port:-0}" == "1" ]]; then
+        open_firewall
+    fi
+
+    # 重建分享链接: 从当前配置读取参数复用 build_share_link 的变量约定
+    if [[ "${is_socks}" == "1" ]]; then
+        MODE="socks"; PROTOCOL=""
+        # 端口/凭据未重置时, 从配置补齐全局变量 (本次会话可能未安装过该模式)
+        SOCKS_PORT="${SOCKS_PORT:-$(grep -o '"port": [0-9]*' "${conf}" | head -1 | grep -o '[0-9]*')}"
+        SOCKS_USER="${SOCKS_USER:-$(grep -o '"user": "[^"]*"' "${conf}" | cut -d'"' -f4)}"
+        SOCKS_PASS="${SOCKS_PASS:-$(grep -o '"pass": "[^"]*"' "${conf}" | cut -d'"' -f4)}"
+        CLIENT_REMARK="${CLIENT_REMARK:-socks5-node}"
+    else
+        MODE="${mode_pick}"; PROTOCOL="vless"
+        # 域名/路径/端口全部从 info 文件与当前配置恢复 (与实际部署一致, 不依赖本次会话状态)
+        local section_key="${svc_label%%+*}"
+        local infoblock
+        infoblock="$(awk -v s="### .*${section_key}" 'BEGIN{IGNORECASE=0} $0 ~ s {f=1} f && /^### / && $0 !~ s {f=0} f' "${INFO_FILE}" 2>/dev/null)"
+        DOMAIN="$(echo "${infoblock}" | grep "^domain=" | tail -1 | cut -d= -f2)"
+        [[ -z "${DOMAIN}" ]] && DOMAIN="$(grep "^domain=" "${INFO_FILE}" 2>/dev/null | tail -1 | cut -d= -f2)"
+        WS_PATH="$(grep -o '"path": "/[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
+        WS_PATH="${WS_PATH#/}"
+        UUID="$(grep -o '"id": "[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
+        # 端口: nginx 监听端口才是客户端连接端口 (ws 可能因 443 被占而用独立端口)
+        if [[ "${mode_pick}" == "1" && -f "${WS_NGINX_CONF}" ]]; then
+            WS_PORT="$(grep -m1 -oE "listen [0-9]+ ssl" "${WS_NGINX_CONF}" | grep -o "[0-9]*")"
+            WS_PORT="${WS_PORT:-443}"
+        else
+            H2_PORT="$(grep -o '"port": [0-9]*' "${conf}" | head -1 | grep -o '[0-9]*')"
+        fi
+        CLIENT_REMARK="${DOMAIN}-${PROTOCOL}-${svc_label%%+*}"
+    fi
+    build_share_link
+    echo "${SHARE_URL}" >> "${URL_FILE}"
+
+    echo
+    echo -e "${GREEN}==========================================${PLAIN}"
+    echo -e "${GREEN}   ${svc_label} 节点重置完成                   ${PLAIN}"
+    echo -e "${GREEN}==========================================${PLAIN}"
+    local c
+    for c in "${changed[@]}"; do
+        echo -e " - ${c}"
+    done
+    echo -e " 新链接   : ${SHARE_URL}"
+    echo -e "${GREEN}==========================================${PLAIN}"
+    log_confirm "客户端请删除旧节点并导入上面的新链接 (旧链接已失效)。"
+}
+
+# 仅更换 REALITY 伪装目标站: 保留 UUID/端口/密钥, 只改 dest+sni, 客户端只需更新 sni 字段
 do_change_reality_dest() {
     check_root
     if [[ ! -f "${REALITY_CONF}" || ! -f "/etc/systemd/system/${REALITY_SERVICE}.service" ]]; then
@@ -2131,7 +2301,8 @@ show_menu() {
     echo -e " 9. 更新 V2Ray / Xray core"
     echo -e "10. 更换 REALITY 伪装站 (保留 UUID/端口, 客户端只改 SNI)"
     echo -e "11. 重置 REALITY 节点 (端口 / UUID / 密钥 / 全部)"
-    echo -e "12. 卸载 (可选单模式或全部)"
+    echo -e "12. 重置 ws/h2/socks 节点 (端口 / UUID / 用户密码)"
+    echo -e "13. 卸载 (可选单模式或全部)"
     echo -e " 0. 退出"
     echo
     read -rp "请选择: " choice || exit 0
@@ -2147,7 +2318,8 @@ show_menu() {
         9) do_update_v2ray ;;
         10) do_change_reality_dest ;;
         11) do_reset_reality ;;
-        12) do_uninstall ;;
+        12) do_reset_node ;;
+        13) do_uninstall ;;
         0) exit 0 ;;
         *) ;;
     esac
