@@ -1105,25 +1105,21 @@ do_install_socks() {
 # ---------- vless + REALITY 模式 (Xray core, 抗封锁首选, 无需域名/证书) ----------
 
 # 候选目标站按地区分组:格式 "站点:端口|地区" (地区用于按 VPS 位置智能排序)
-# 选站原则: 大厂自有域名、支持 TLS1.3+H2、非 CDN 共享域、在当地访问质量好
+# 选站原则: 大厂自有域名、支持 TLS1.3+H2、非 CDN 共享域、在当地访问质量好,
+#           且必须"大陆可正常访问" —— 被墙站作 SNI 会触发 GFW 的 SNI 级回程阻断 (实战教训)
 REALITY_DEST_POOL=(
-    # 香港
-    "www.hk01.com:443|香港"
+    # 香港 (大陆可达的大站)
     "www.hket.com:443|香港"
     # 台湾
     "www.momoshop.com.tw:443|台湾"
-    "www.chinatimes.com:443|台湾"
     # 新加坡
     "www.singtel.com:443|新加坡"
     "www.dbs.com:443|新加坡"
     # 日本
-    "www.yahoo.co.jp:443|日本"
     "www.rakuten.co.jp:443|日本"
-    "www.lovelive-anime.jp:443|日本"
     # 韩国
-    "www.naver.com:443|韩国"
     "www.samsung.com:443|韩国"
-    # 美国
+    # 美国 (大陆可达, 推荐优先)
     "www.tesla.com:443|美国"
     "www.microsoft.com:443|美国"
     "www.nvidia.com:443|美国"
@@ -1132,8 +1128,38 @@ REALITY_DEST_POOL=(
     "www.bmw.de:443|德国"
     "www.airbus.com:443|法国"
     "www.ns.nl:443|荷兰"
-    "www.bbc.co.uk:443|英国"
 )
+
+# 已知被墙/大陆不可达站点 (从候选池移除, 仅作参考说明):
+#   www.hk01.com / www.chinatimes.com / www.yahoo.co.jp / www.naver.com /
+#   www.lovelive-anime.jp / www.bbc.co.uk —— 实战验证: 作 SNI 会触发 GFW 按
+#   ClientHello 中的 SNI 选择性阻断回程, 节点表现为延迟 -1 (2026-10 真实案例)
+
+# 检查域名是否在 GFW 封锁列表 (Loyalsoldier gfw.txt)
+# 匹配: 精确域名 + 其父域在列表 (如 gfw.txt 有 "yahoo.com" 时, xxx.yahoo.com 视为命中)
+# 返回 0 = 命中 (大陆不可达倾向, 应降权), 1 = 不在或检测失败
+check_gfw_list() {
+    local domain="$1"
+    local base="${domain#www.}"
+    local list_file="${V2RAY_CONF_DIR}/gfw_list.txt"
+    # 列表缓存 7 天
+    if [[ ! -s "${list_file}" ]] || [[ $(find "${list_file}" -mtime +7 2>/dev/null | wc -l) -gt 0 ]]; then
+        mkdir -p "${V2RAY_CONF_DIR}"
+        curl -sL --max-time 30 -o "${list_file}" \
+            "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt" 2>/dev/null || return 1
+    fi
+    [[ -s "${list_file}" ]] || return 1
+    # 逐级父域检查: a.b.c -> b.c -> c
+    local parts rest
+    rest="${base}"
+    while [[ "${rest}" == *.* ]]; do
+        if grep -qE "^${rest}$|^\.${rest}$" "${list_file}" 2>/dev/null; then
+            return 0
+        fi
+        rest="${rest#*.}"
+    done
+    return 1
+}
 
 # 获取 VPS 所在地区 (基于时区, 无外部依赖; 失败返回空)
 detect_vps_region() {
@@ -1236,6 +1262,7 @@ do_install_reality() {
     record_port "${REALITY_PORT}"
 
     # 探测候选池: 按 VPS 所在地区智能排序 (同地区优先), 生成可用目标站列表
+    # 大陆可达性过滤: 在 GFW 列表内的站降权到列表尾部 (作 SNI 会触发回程阻断)
     local vps_region
     vps_region="$(detect_vps_region)"
     local sorted_pool=()
@@ -1249,6 +1276,23 @@ do_install_reality() {
     done
     if [[ -n "${vps_region}" ]]; then
         log_info "检测到 VPS 位于 ${vps_region},同地区站点优先探测。"
+    fi
+
+    # GFW 列表检查: 一次下载, 全池复用; 在列表中的站移到尾部
+    local gfw_checked=0
+    local pool_head=() pool_tail=()
+    for entry in "${sorted_pool[@]}"; do
+        local d="${entry%%|*}"
+        if check_gfw_list "${d}"; then
+            gfw_checked=1
+            log_info "${d} 在 GFW 封锁列表内,降权 (作伪装站会被 SNI 阻断)。"
+            pool_tail+=("${entry}")
+        else
+            pool_head+=("${entry}")
+        fi
+    done
+    if (( ${#pool_tail[@]} > 0 )); then
+        sorted_pool=("${pool_head[@]}" "${pool_tail[@]}")
     fi
 
     local ok_dests=()
