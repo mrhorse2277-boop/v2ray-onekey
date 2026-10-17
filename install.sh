@@ -1356,6 +1356,15 @@ do_install_reality() {
         fi
     fi
 
+    # 部署前终验: 选定/自定义的站再即时校验一次 (防探测与选择之间的状态变化), 不达标则退出
+    log_info "部署前终验目标站 ${REALITY_DEST} ..."
+    if ! check_reality_dest "${REALITY_DEST}" "${REALITY_SNI}"; then
+        log_error "目标站 ${REALITY_DEST} 部署前校验未通过 (状态已变化), 本次安装中止。"
+        log_confirm "请重新运行安装并选择其他目标站。"
+        exit 1
+    fi
+    log_info "  -> 终验通过,开始部署。"
+
     # 密钥对与 shortId
     if ! gen_x25519; then
         log_error "生成 x25519 密钥对失败 (xray 命令不可用)。"
