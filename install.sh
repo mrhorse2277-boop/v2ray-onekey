@@ -193,6 +193,68 @@ check_system() {
     log_info "当前系统: ${PRETTY_NAME:-${ID}}"
 }
 
+# 环境预检: 在安装前一次性确认系统环境满足运行条件, 缺什么明确报告而不是中途报错
+preflight_check() {
+    local errors=() warns=()
+
+    # 1. systemd: 全部服务管理依赖它 (LXC/容器可能没有)
+    if ! command -v systemctl >/dev/null 2>&1; then
+        errors+=("缺少 systemctl (无 systemd?) —— 本脚本需要在 systemd 环境运行,不支持纯容器")
+    elif [[ ! -d /run/systemd/system ]]; then
+        warns+=("systemd 未运行 (容器环境?),服务安装后可能无法自启,需手动管理")
+    fi
+
+    # 2. 核心工具: 缺失即无法继续 (iproute2 提供 ss, coreutils 提供 timeout/shuf/od)
+    local t missing_core=""
+    for t in curl ss timeout shuf awk sed grep openssl; do
+        command -v "${t%% *}" >/dev/null 2>&1 || missing_core+="${t} "
+    done
+    [[ -n "${missing_core}" ]] && errors+=("缺少核心工具: ${missing_core}(将尝试通过包管理器安装,失败请手动装)")
+
+    # 3. 架构: v2ray/xray 官方发布支持的范围
+    local arch
+    arch="$(uname -m)"
+    case "${arch}" in
+        x86_64|aarch64|armv7l|riscv64|loongarch64) ;;
+        *) errors+=("不支持的 CPU 架构: ${arch} (支持 x86_64/aarch64/armv7l/riscv64/loongarch64)") ;;
+    esac
+
+    # 4. 虚拟化探测 (仅提示): OpenVZ/LXC 老面板内核常缺 TUN/部分模块
+    if [[ -f /proc/vz ]] && ! grep -q vzfs /proc/mounts 2>/dev/null; then
+        :
+    elif [[ -d /proc/vz ]]; then
+        warns+=("检测到 OpenVZ 虚拟化,部分内核模块可能受限")
+    fi
+
+    # 5. 网络出口: 访问 GitHub (安装 core 必需)
+    if ! curl -sI --max-time 8 https://github.com -o /dev/null 2>&1; then
+        warns+=("当前网络访问 github.com 不畅,安装/更新 core 可能失败 (代理或更换镜像)")
+    fi
+
+    # 6. 磁盘空间: core+geo 约需 200MB
+    local avail_mb
+    avail_mb="$(df -Pm / | tail -1 | awk '{print $4}')"
+    if (( avail_mb < 200 )); then
+        errors+=("根分区剩余空间不足: ${avail_mb}MB (至少需要 200MB)")
+    elif (( avail_mb < 500 )); then
+        warns+=("根分区剩余空间偏少: ${avail_mb}MB")
+    fi
+
+    # 报告
+    local w
+    for w in "${warns[@]}"; do
+        log_warn "预检: ${w}"
+    done
+    if (( ${#errors[@]} > 0 )); then
+        local e
+        for e in "${errors[@]}"; do
+            log_error "预检失败: ${e}"
+        done
+        exit 1
+    fi
+    log_info "环境预检通过 (arch=${arch}, 磁盘可用 ${avail_mb}MB)"
+}
+
 install_dependencies() {
     log_info "安装基础依赖 (curl wget socat qrencode openssl cron)..."
     if command -v apt-get >/dev/null 2>&1; then
@@ -203,13 +265,13 @@ install_dependencies() {
     elif command -v dnf >/dev/null 2>&1; then
         # Rocky/Alma/Fedora: qrencode 在 EPEL (部分镜像已内置)
         dnf install -y epel-release >/dev/null 2>&1 || true
-        dnf install -y curl wget socat qrencode openssl cronie || true
+        dnf install -y curl wget socat qrencode openssl cronie iproute coreutils || true
         command -v qrencode >/dev/null 2>&1 || dnf install -y qrencode >/dev/null 2>&1 || true
         systemctl enable --now crond >/dev/null 2>&1
     elif command -v yum >/dev/null 2>&1; then
         # CentOS 7 (EOL): 若官方源已归档失败, 不阻断; qrencode 在 EPEL
         yum install -y epel-release >/dev/null 2>&1 || true
-        yum install -y curl wget socat openssl cronie || true
+        yum install -y curl wget socat openssl cronie iproute coreutils || true
         yum install -y qrencode >/dev/null 2>&1 || true
         systemctl enable --now crond >/dev/null 2>&1
     else
@@ -2329,6 +2391,7 @@ do_update_v2ray() {
 do_install() {
     check_root
     check_system
+    preflight_check
     install_dependencies
 
     case "${MODE}" in
