@@ -1841,18 +1841,34 @@ do_uninstall() {
             rm -f "${WS_NGINX_CONF}" "/etc/nginx/conf.d/v2ray-ws-tls.conf" "${BT_NGINX_VHOST_DIR}/v2ray-ws-tls.conf" \
                   "${WS_CONF}" "${H2_CONF}" "${SOCKS_CONF}" "${REALITY_CONF}" \
                   "${INFO_FILE}" "${URL_FILE}" "${SSL_UPDATE_SH}"
-            if command -v v2ray >/dev/null 2>&1 && [[ -f /usr/local/bin/v2ray-uninstall ]]; then
+            if [[ -f /usr/local/bin/v2ray-uninstall ]]; then
                 bash /usr/local/bin/v2ray-uninstall || true
+            else
+                # fhs-install 的卸载是独立脚本, 不存在时在线拉取执行 (--remove)
+                bash <(curl -L -s https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh) --remove 2>/dev/null || true
             fi
-            if command -v xray >/dev/null 2>&1 && [[ -f /usr/local/bin/xray-uninstall ]]; then
+            if [[ -f /usr/local/bin/xray-uninstall ]]; then
                 bash /usr/local/bin/xray-uninstall || true
             fi
+            # Xray 官方安装脚本无 --remove 选项, 手动清理其安装内容
+            systemctl disable --now xray 2>/dev/null || true
+            rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service
+            rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d
+            rm -f /usr/local/bin/xray
+            rm -rf /usr/local/share/xray /usr/local/etc/xray
+            # 官方卸载后的残余: 模板配置与空目录清理
+            rm -f "${XRAY_CONF_DIR}/config.json"
+            rmdir "${V2RAY_CONF_DIR}" "${XRAY_CONF_DIR}" 2>/dev/null || true
             # 平滑重载 Nginx (宝塔或发行版), 绝不 stop 现有网站服务
             if [[ "${NGINX_ENV}" == "btpanel" && -x "${NGINX_BIN}" ]]; then
                 "${NGINX_BIN}" -t >/dev/null 2>&1 && "${NGINX_BIN}" -s reload
             elif command -v nginx >/dev/null 2>&1; then
                 nginx -t >/dev/null 2>&1 && systemctl reload nginx
             fi
+            # 清理脚本自身的缓存与记录文件
+            rm -f "${V2RAY_CONF_DIR}/used_ports.txt" "${V2RAY_CONF_DIR}/gfw_list.txt"
+            # 目录为空则删除, 非空 (还有用户文件) 保留
+            rmdir "${V2RAY_CONF_DIR}" "${XRAY_CONF_DIR}" 2>/dev/null || true
             log_info "全部卸载完成。证书 (acme.sh / ${CERT_DIR}) 与伪装站点目录保留,如需彻底清理请手动删除。"
             systemctl daemon-reload
             return
@@ -1860,6 +1876,31 @@ do_uninstall() {
         *) return ;;
     esac
     systemctl daemon-reload
+    # 同步清理 URL_FILE 中已卸载模式的链接行 (保留仍在运行的模式的链接)
+    if [[ -f "${URL_FILE}" ]]; then
+        local keep=() line is_reality=0 is_ws=0 is_h2=0 is_socks=0
+        [[ -f "/etc/systemd/system/${REALITY_SERVICE}.service" ]] && is_reality=1
+        [[ -f "/etc/systemd/system/${WS_SERVICE}.service" ]] && is_ws=1
+        [[ -f "/etc/systemd/system/${H2_SERVICE}.service" ]] && is_h2=1
+        [[ -f "/etc/systemd/system/${SOCKS_SERVICE}.service" ]] && is_socks=1
+        while IFS= read -r line; do
+            [[ -z "${line}" ]] && continue
+            if [[ "${line}" == reality* || "${line}" == *security=reality* ]]; then
+                [[ "${is_reality}" == "1" ]] && keep+=("${line}")
+            elif [[ "${line}" == *type=ws* || "${line}" == *-vless-ws* ]]; then
+                [[ "${is_ws}" == "1" ]] && keep+=("${line}")
+            elif [[ "${line}" == *type=h2* ]]; then
+                [[ "${is_h2}" == "1" ]] && keep+=("${line}")
+            elif [[ "${line}" == socks* ]]; then
+                [[ "${is_socks}" == "1" ]] && keep+=("${line}")
+            else
+                keep+=("${line}")
+            fi
+        done < "${URL_FILE}"
+        printf '%s
+' "${keep[@]}" > "${URL_FILE}" 2>/dev/null || rm -f "${URL_FILE}"
+    fi
+    # used_ports: 剔除已卸载模式占用的端口 (按 systemd 服务存在与否无法判断端口, 简化为全部卸载时清空, 单模式保留)
     log_info "卸载完成。"
 }
 
