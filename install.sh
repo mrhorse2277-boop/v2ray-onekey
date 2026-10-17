@@ -86,7 +86,9 @@ SOCKS_PORT=""
 SOCKS_USER=""
 SOCKS_PASS=""
 REALITY_PORT=""
-REALITY_DEST=""
+# REALITY_DEST 允许环境变量预设 (REALITY_DEST="域名:端口" bash install.sh reality),
+# 因此这里不能无条件清空, 用 :- 兜底
+REALITY_DEST="${REALITY_DEST:-}"
 REALITY_SNI=""
 REALITY_PUBKEY=""
 REALITY_SID=""
@@ -1203,26 +1205,26 @@ detect_vps_region() {
 }
 
 # REALITY 目标站交互选择:
-#   1..N  从探测通过的候选站中挑选
+#   1..N  从探测通过的候选站中挑选 (按实测延迟升序, 列表带延迟)
 #   c     自定义输入任意域名:port (校验 TLS1.3/H2 达标才接受, 不达标可重输)
-#   直接回车 = 默认第一个可用候选
-# 参数: $1 = 可用候选数组名 (nameref)
+#   直接回车 = 默认第一个 (延迟最低)
+# 参数: $1 = 可用候选数组名 (nameref, 元素格式 "dest|延迟ms")
 select_reality_dest_interactive() {
     local -n _ok="$1"
     echo
-    echo "请选择 REALITY 伪装目标站 (探测通过 $((${#_ok[@]})) 个):"
+    echo "请选择 REALITY 伪装目标站 (探测通过 $((${#_ok[@]})) 个, 按延迟排序):"
     local i
     for (( i=0; i<${#_ok[@]}; i++ )); do
-        echo "  $((i+1)). ${_ok[$i]}"
+        echo "  $((i+1)). ${_ok[$i]%%|*}  (${_ok[$i]##*|}ms)"
     done
     echo "  c. 自定义其他域名 (自动校验 TLS1.3/H2, 达标才接受)"
     echo
     echo "提示: 优先选与 VPS 同地区、你平时常访问的大站, 伪装更自然。"
     while :; do
-        read -rp "请输入编号 / c / 直接回车默认 [${_ok[0]}]: " pick || return 1
+        read -rp "请输入编号 / c / 直接回车默认 [${_ok[0]%%|*}]: " pick || return 1
         case "${pick}" in
             "")
-                REALITY_DEST="${_ok[0]}"
+                REALITY_DEST="${_ok[0]%%|*}"
                 REALITY_SNI="${REALITY_DEST%%:*}"
                 log_info "已选择默认目标站 ${REALITY_DEST}"
                 return 0
@@ -1253,7 +1255,7 @@ select_reality_dest_interactive() {
                 ;;
             *)
                 if [[ "${pick}" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#_ok[@]} )); then
-                    REALITY_DEST="${_ok[$((pick-1))]}"
+                    REALITY_DEST="${_ok[$((pick-1))]%%|*}"
                     REALITY_SNI="${REALITY_DEST%%:*}"
                     log_info "已选择目标站 ${REALITY_DEST}"
                     return 0
@@ -1283,30 +1285,32 @@ do_install_reality() {
     fi
     record_port "${REALITY_PORT}"
 
-    # 探测候选池: 按 VPS 所在地区智能排序 (同地区优先), 生成可用目标站列表
-    # 大陆可达性过滤: 在 GFW 列表内的站降权到列表尾部 (作 SNI 会触发回程阻断)
+    # 探测候选池: 大陆可达性过滤 + TLS 探测 + 实测延迟排序 (数据驱动, 无地区预设)
+    # 环境变量 REALITY_DEST="域名:端口" 可直接指定目标站 (跳过探测与选择, 仍做部署前终验)
+    if [[ -n "${REALITY_DEST:-}" ]]; then
+        REALITY_DEST="${REALITY_DEST//[$'\r\n']/}"
+        REALITY_DEST="${REALITY_DEST,,}"
+        REALITY_SNI="${REALITY_DEST%%:*}"
+        REALITY_DEST_REALIZED=1
+        log_info "使用环境变量指定的目标站: ${REALITY_DEST}"
+    else
     local vps_region
     vps_region="$(detect_vps_region)"
     local sorted_pool=()
     local entry
-    # 同地区的排前面, 其余保持池内原顺序
+    # 同地区的排前面 (仅作为探测顺序的初始参考, 最终以实测延迟排序)
     for entry in "${REALITY_DEST_POOL[@]}"; do
         [[ "${entry##*|}" == "${vps_region}" ]] && sorted_pool+=("${entry}")
     done
     for entry in "${REALITY_DEST_POOL[@]}"; do
         [[ "${entry##*|}" != "${vps_region}" ]] && sorted_pool+=("${entry}")
     done
-    if [[ -n "${vps_region}" ]]; then
-        log_info "检测到 VPS 位于 ${vps_region},同地区站点优先探测。"
-    fi
 
     # GFW 列表检查: 一次下载, 全池复用; 在列表中的站移到尾部
-    local gfw_checked=0
     local pool_head=() pool_tail=()
     for entry in "${sorted_pool[@]}"; do
         local d="${entry%%|*}"
         if check_gfw_list "${d}"; then
-            gfw_checked=1
             log_info "${d} 在 GFW 封锁列表内,降权 (作伪装站会被 SNI 阻断)。"
             pool_tail+=("${entry}")
         else
@@ -1317,13 +1321,13 @@ do_install_reality() {
         sorted_pool=("${pool_head[@]}" "${pool_tail[@]}")
     fi
 
+    # TLS 探测 + 实测 TCP 延迟: 通过的记入 "dest|延迟ms", 之后按延迟升序排
     local ok_dests=()
     local probed=()
     for entry in "${sorted_pool[@]}"; do
         local d="${entry%%|*}"
         local region="${entry##*|}"
         local s="${d%%:*}"
-        # 已探测过则跳过 (池内有重复站点时)
         local dup=0
         local pd
         for pd in "${probed[@]}"; do [[ "${pd}" == "${d}" ]] && dup=1; done
@@ -1331,28 +1335,43 @@ do_install_reality() {
         probed+=("${d}")
         log_info "校验伪装目标站 ${d} (${region}) ..."
         if check_reality_dest "${d}" "${s}"; then
-            log_info "  -> 可用"
-            ok_dests+=("${d}")
+            # 实测 TCP 握手延迟 (毫秒, 取整)
+            local ms
+            ms=$( { TIMEFORMAT=%R; time timeout 5 bash -c "echo > /dev/tcp/${d%%:*}/${s}" 2>/dev/null; } 2>&1 )
+            [[ -z "${ms}" ]] && ms=9999
+            ms=$(awk -v t="${ms}" 'BEGIN{printf "%d", t*1000}')
+            ok_dests+=("${d}|${ms}")
+            log_info "  -> 可用 (TCP 延迟 ${ms}ms)"
         else
             log_info "  -> 不可用,跳过"
         fi
-        # 最多探测通过 8 个即可, 避免全池 20 站逐个探测拖太久
-        (( ${#ok_dests[@]} >= 8 )) && break
+        # 最多探测通过 10 个即可
+        (( ${#ok_dests[@]} >= 10 )) && break
     done
 
+    if (( ${#ok_dests[@]} > 0 )); then
+        # 按实测延迟升序排序 (稳定: 同延迟保持原序)
+        ok_dests=($(printf '%s\n' "${ok_dests[@]}" | sort -t'|' -k2 -n))
+        log_info "候选按实测延迟排序: ${ok_dests[0]%%|*} (${ok_dests[0]##*|}ms) 最快"
+    fi
+    fi   # end REALITY_DEST env override
+
     # 目标站选择: 交互模式列出可用候选让用户挑, 或自定义任意域名 (校验达标才接受);
-    # 非交互模式 (stdin 非终端) 自动选第一个通过的候选
-    if [[ -t 0 ]]; then
-        select_reality_dest_interactive ok_dests
-    else
-        if (( ${#ok_dests[@]} > 0 )); then
-            REALITY_DEST="${ok_dests[0]}"
-            REALITY_SNI="${REALITY_DEST%%:*}"
-            log_info "非交互模式,自动选用 ${REALITY_DEST}"
+    # 非交互模式 (stdin 非终端) 自动选延迟最低的候选
+    # 注意: REALITY_DEST 环境变量已指定时跳过本段 (env 分支已完成赋值)
+    if [[ -z "${REALITY_DEST_REALIZED:-}" ]]; then
+        if [[ -t 0 ]]; then
+            select_reality_dest_interactive ok_dests
         else
-            log_warn "所有预置目标站校验均未通过,使用 ${REALITY_DEST_POOL[0]%%|*} 兜底 (若后续连接异常请手动更换 dest/sni)。"
-            REALITY_DEST="${REALITY_DEST_POOL[0]%%|*}"
-            REALITY_SNI="${REALITY_DEST%%:*}"
+            if (( ${#ok_dests[@]} > 0 )); then
+                REALITY_DEST="${ok_dests[0]%%|*}"
+                REALITY_SNI="${REALITY_DEST%%:*}"
+                log_info "非交互模式,自动选用延迟最低的 ${REALITY_DEST} (${ok_dests[0]##*|}ms)"
+            else
+                log_warn "所有预置目标站校验均未通过,使用 ${REALITY_DEST_POOL[0]%%|*} 兜底 (若后续连接异常请手动更换 dest/sni)。"
+                REALITY_DEST="${REALITY_DEST_POOL[0]%%|*}"
+                REALITY_SNI="${REALITY_DEST%%:*}"
+            fi
         fi
     fi
 
