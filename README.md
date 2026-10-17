@@ -57,8 +57,8 @@ Debian 10+ / Ubuntu 18.04+ / CentOS 7+/Rocky/AlmaLinux,推荐 Debian 11+ 或 Ubu
 准备:境外 VPS。ws 与 h2 模式需要域名(已解析 A 记录);socks5 和 REALITY **不需要域名和证书**。
 
 ```bash
-# 一键下载并进入交互菜单 (将 YOUR-NAME/REPO 替换为实际仓库路径)
-wget -N --no-check-certificate -q -O install.sh "https://raw.githubusercontent.com/YOUR-NAME/REPO/main/install.sh" && chmod +x install.sh && bash install.sh
+# 一键下载并进入交互菜单 (将 mrhorse2277-boop/v2ray-onekey 替换为实际仓库路径)
+wget -N --no-check-certificate -q -O install.sh "https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh" && chmod +x install.sh && bash install.sh
 ```
 
 # 非交互
