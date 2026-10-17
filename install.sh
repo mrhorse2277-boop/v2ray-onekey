@@ -1400,8 +1400,27 @@ do_install_reality() {
                     log_info "自动切换到下一候选 ${REALITY_DEST} (${ok_dests[0]##*|}ms), 重新终验..."
                     continue
                 fi
-                log_error "所有候选均未通过终验,本次安装中止。"
-                exit 1
+                # 候选耗尽: 交回用户自定义输入 (校验通过才接受, 输 q 放弃)
+                while :; do
+                    log_error "所有预置候选均未通过终验。"
+                    read -rp "请手动输入自定义目标站 (格式 域名:端口, 如 www.example.com:443; 输入 q 放弃安装): " custom || exit 1
+                    custom="${custom//[$'\r\n']/}"
+                    custom="${custom,,}"
+                    [[ "${custom}" == "q" || "${custom}" == "Q" ]] && { log_error "已放弃,本次安装中止。"; exit 1; }
+                    if ! echo "${custom}" | grep -Eq '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+:[0-9]+$'; then
+                        log_error "格式不对,应为 域名:端口"
+                        continue
+                    fi
+                    REALITY_DEST="${custom}"
+                    REALITY_SNI="${custom%%:*}"
+                    log_info "校验自定义目标站 ${REALITY_DEST} ..."
+                    if check_reality_dest "${REALITY_DEST}" "${REALITY_SNI}"; then
+                        log_info "  -> 校验通过,开始部署。"
+                        break 2
+                    fi
+                    log_error "  -> 校验未通过,请换一个域名或输 q 放弃。"
+                done
+                break
             fi
             # 交互模式: 回退重选
             if (( ${#ok_dests[@]} > 0 )); then
