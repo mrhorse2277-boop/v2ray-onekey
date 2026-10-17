@@ -300,6 +300,8 @@ nginx_check_reload() {
 
 open_firewall() {
     # 尽力而为:存在防火墙服务才放行,失败不阻断
+    # REALITY 端口在任何模式下都必须放行 (独立服务, 端口安装时才确定)
+    if [[ -n "${REALITY_PORT}" ]]; then :; fi
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw allow 80/tcp >/dev/null 2>&1
         ufw allow 443/tcp >/dev/null 2>&1
