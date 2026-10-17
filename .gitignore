@@ -1,0 +1,13 @@
+# Windows / 编辑器
+Thumbs.db
+Desktop.ini
+.vs/
+.idea/
+
+# 本地测试产物
+itest/
+t2/
+t3/
+t4/
+ref/
+*.log

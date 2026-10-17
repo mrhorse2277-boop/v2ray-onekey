@@ -1,5 +1,7 @@
 # V2Ray/Xray 多模式一键脚本
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 参考 [wulabing/V2Ray_ws-tls_bash_onekey](https://github.com/wulabing/V2Ray_ws-tls_bash_onekey) 的架构重写,
 支持 **ws+tls / h2+tls / socks5 / vless+REALITY 四种模式同时安装、互不冲突**,分享链接适配最新版
 [v2rayN](https://github.com/2dust/v2rayN) / [v2rayNG](https://github.com/2dust/v2rayNG) 正式版。
@@ -55,12 +57,12 @@ Debian 10+ / Ubuntu 18.04+ / CentOS 7+/Rocky/AlmaLinux,推荐 Debian 11+ 或 Ubu
 准备:境外 VPS。ws 与 h2 模式需要域名(已解析 A 记录);socks5 和 REALITY **不需要域名和证书**。
 
 ```bash
-# 交互菜单
-bash install.sh
+# 一键下载并进入交互菜单 (将 YOUR-NAME/REPO 替换为实际仓库路径)
+wget -N --no-check-certificate -q -O install.sh "https://raw.githubusercontent.com/YOUR-NAME/REPO/main/install.sh" && chmod +x install.sh && bash install.sh
+```
 
 # 非交互
-bash install.sh ws vmess     # vmess + ws + tls (Nginx, 443)
-bash install.sh ws vless     # vless + ws + tls
+bash install.sh ws vmess     # vmess + ws + tls (Nginx, 443)bash install.sh ws vless     # vless + ws + tls
 bash install.sh h2 vmess     # vmess + h2 + tls (独立端口)
 bash install.sh h2 vless     # vless + h2 + tls
 bash install.sh socks        # socks5 (随机用户名/密码, 独立端口)
