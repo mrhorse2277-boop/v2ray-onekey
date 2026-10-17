@@ -682,8 +682,15 @@ EOF
 write_ws_nginx_config() {
     # 每次安装都覆盖本节点的 nginx 配置;不动其他站点配置
     # 共存场景 (宝塔/已有网站占用 80/443): 不写 80 重定向与 80 监听, 只在 443 server_name 上追加代理路径
+    # 443 冲突场景: REALITY 先装且占用 443 时, nginx 无法绑定 443 (nginx -t 却不报错, 静默失效),
+    # 因此 ws 改用独立 TLS 端口 (WS_PORT), 分享链接同步使用该端口
+    local listen_port=443
+    if [[ -n "${WS_PORT:-}" ]]; then
+        listen_port="${WS_PORT}"
+    fi
+
     local http_block=""
-    if [[ "${NGINX_ENV}" == "none" ]]; then
+    if [[ "${NGINX_ENV}" == "none" && "${listen_port}" == "443" ]]; then
         http_block="server {
     listen 80;
     listen [::]:80;
@@ -693,12 +700,12 @@ write_ws_nginx_config() {
     fi
 
     # http2 指令: nginx >= 1.25.1 用 "http2 on", 旧版用 "listen ... http2"
-    local http2_line1="listen 443 ssl http2;"
-    local http2_line2="listen [::]:443 ssl http2;"
+    local http2_line1="listen ${listen_port} ssl http2;"
+    local http2_line2="listen [::]:${listen_port} ssl http2;"
     if "${NGINX_BIN}" -v 2>&1 | grep -qE "nginx/(1\.2[5-9]|1\.[3-9][0-9]|[2-9]\.)" \
         || "${NGINX_BIN}" -v 2>&1 | grep -qE "nginx/1\.25\.[1-9]"; then
-        http2_line1="listen 443 ssl;"
-        http2_line2="listen [::]:443;
+        http2_line1="listen ${listen_port} ssl;"
+        http2_line2="listen [::]:${listen_port};
     http2 on;"
     fi
 
@@ -794,6 +801,19 @@ do_install_ws() {
     record_port "${INTERNAL_PORT}"
     WS_PATH="$(gen_random 16)"
     CLIENT_REMARK="${DOMAIN}-${PROTOCOL}-ws"
+
+    # 443 端口冲突检测: 若 443 已被占用且占用者是本脚本的 REALITY (xray),
+    # nginx 将无法绑定 443 (静默失效), ws 改用独立 TLS 端口
+    WS_PORT=443
+    if ss -lnt 2>/dev/null | awk '{print $NF}' | grep -q "xray" || ss -lnp 2>/dev/null | grep ":443 " | grep -q "xray"; then
+        WS_PORT="$(gen_port "${V2RAY_CONF_DIR}/used_ports.txt")"
+        record_port "${WS_PORT}"
+        log_warn "检测到 443 端口已被 xray (REALITY 模式) 占用,ws 将监听独立端口 ${WS_PORT}。"
+        log_warn "请确保防火墙/安全组放行 ${WS_PORT}/tcp。"
+    elif ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE '[:.]443$'; then
+        # 443 被其他进程占用 (如已有 nginx/宝塔): nginx 已在 443 服务, vhost 直接并入, 无需换端口
+        WS_PORT=443
+    fi
 
     write_ws_v2ray_config
     write_ws_nginx_config
@@ -1430,7 +1450,7 @@ build_share_link() {
     if [[ "${MODE}" == "h2" ]]; then
         local port="${H2_PORT}" net="h2"
     else
-        local port="443" net="ws"
+        local port="${WS_PORT:-443}" net="ws"
     fi
 
     if [[ "${PROTOCOL}" == "vless" ]]; then
@@ -1491,7 +1511,7 @@ append_info() {
             echo "path=/${WS_PATH}"
         else
             echo "domain=${DOMAIN}"
-            echo "port=443"
+            echo "port=${WS_PORT:-443}"
             echo "uuid=${UUID}"
             echo "path=/${WS_PATH}"
         fi
@@ -1520,7 +1540,7 @@ show_mode_info() {
     elif [[ "${MODE}" != "socks" ]]; then
         echo -e " 域名        : ${DOMAIN}"
     fi
-    echo -e " 端口        : $([[ "${MODE}" == "ws" ]] && echo 443 || { [[ "${MODE}" == "h2" ]] && echo "${H2_PORT}" || echo "${SOCKS_PORT}"; })"
+    echo -e " 端口        : $([[ "${MODE}" == "ws" ]] && echo "${WS_PORT:-443}" || { [[ "${MODE}" == "h2" ]] && echo "${H2_PORT}" || echo "${SOCKS_PORT}"; })"
     if [[ "${MODE}" == "socks" ]]; then
         echo -e " 用户名      : ${SOCKS_USER}"
         echo -e " 密码        : ${SOCKS_PASS}"
