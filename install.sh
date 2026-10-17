@@ -1848,7 +1848,126 @@ do_uninstall() {
     log_info "卸载完成。"
 }
 
-# ---------- 更新 ----------
+# 仅更换 REALITY 伪装目标站: 保留 UUID/端口/密钥, 只改 dest+sni, 客户端只需更新 sni 字段
+do_change_reality_dest() {
+    check_root
+    if [[ ! -f "${REALITY_CONF}" || ! -f "/etc/systemd/system/${REALITY_SERVICE}.service" ]]; then
+        log_error "未安装 REALITY 模式,请先通过菜单 6 或 bash install.sh reality 安装。"
+        return
+    fi
+    # 从现有配置读取保留参数
+    local cur_dest
+    cur_dest="$(grep -o '"dest": "[^"]*"' "${REALITY_CONF}" | head -1 | cut -d'"' -f4)"
+    local cur_port
+    cur_port="$(grep -o '"port": [0-9]*' "${REALITY_CONF}" | head -1 | grep -o '[0-9]*')"
+    log_info "当前伪装站: ${cur_dest} (端口 ${cur_port})"
+
+    # 选择新站: 复用候选池探测 + GFW 过滤 + 延迟排序 + 交互选择/自定义 (与安装同一套逻辑)
+    local sorted_pool=() entry
+    for entry in "${REALITY_DEST_POOL[@]}"; do
+        [[ "${entry%%|*}" != "${cur_dest}" ]] && sorted_pool+=("${entry}")
+    done
+    local pool_head=() pool_tail=()
+    for entry in "${sorted_pool[@]}"; do
+        if check_gfw_list "${entry%%|*}"; then
+            pool_tail+=("${entry}")
+        else
+            pool_head+=("${entry}")
+        fi
+    done
+    sorted_pool=("${pool_head[@]}" "${pool_tail[@]}")
+
+    local ok_dests=() probed=()
+    for entry in "${sorted_pool[@]}"; do
+        local d="${entry%%|*}" s="${d%%:*}"
+        local dup=0 pd
+        for pd in "${probed[@]}"; do [[ "${pd}" == "${d}" ]] && dup=1; done
+        [[ "${dup}" == "1" ]] && continue
+        probed+=("${d}")
+        log_info "校验伪装目标站 ${d} ..."
+        if check_reality_dest "${d}" "${s}"; then
+            local ms
+            ms=$( { TIMEFORMAT=%R; time timeout 5 bash -c "echo > /dev/tcp/${d%%:*}/${s}" 2>/dev/null; } 2>&1 )
+            [[ -z "${ms}" ]] && ms=9999
+            ms=$(awk -v t="${ms}" 'BEGIN{printf "%d", t*1000}')
+            ok_dests+=("${d}|${ms}")
+            log_info "  -> 可用 (TCP 延迟 ${ms}ms)"
+        else
+            log_info "  -> 不可用,跳过"
+        fi
+        (( ${#ok_dests[@]} >= 10 )) && break
+    done
+    if (( ${#ok_dests[@]} > 0 )); then
+        ok_dests=($(printf '%s\n' "${ok_dests[@]}" | sort -t'|' -k2 -n))
+    fi
+
+    if [[ -t 0 ]]; then
+        select_reality_dest_interactive ok_dests
+    else
+        REALITY_DEST="${ok_dests[0]%%|*}"
+        REALITY_SNI="${REALITY_DEST%%:*}"
+        log_info "非交互模式,自动选用延迟最低的 ${REALITY_DEST} (${ok_dests[0]##*|}ms)"
+    fi
+
+    # 终验 (失败回退: 剔除后重选, 逻辑与安装一致, 简化为最多重试 3 次换下一候选)
+    local tries=0
+    while ! check_reality_dest "${REALITY_DEST}" "${REALITY_SNI}"; do
+        tries=$((tries + 1))
+        log_error "目标站 ${REALITY_DEST} 终验未通过 (第 ${tries} 次)。"
+        (( tries >= 3 )) && { log_error "连续 3 次失败,放弃更换 (原配置未动)。"; return 1; }
+        local remain=() od
+        for od in "${ok_dests[@]}"; do
+            [[ "${od%%|*}" != "${REALITY_DEST}" ]] && remain+=("${od}")
+        done
+        ok_dests=("${remain[@]}")
+        (( ${#ok_dests[@]} == 0 )) && { log_error "无可用候选,放弃更换 (原配置未动)。"; return 1; }
+        REALITY_DEST="${ok_dests[0]%%|*}"
+        REALITY_SNI="${REALITY_DEST%%:*}"
+        log_info "自动切换到 ${REALITY_DEST} (${ok_dests[0]##*|}ms) 重试..."
+    done
+
+    # 仅改 dest/sni, 保留 port/uuid/密钥/sid
+    sed -i "s|\"dest\": \"${cur_dest}\"|\"dest\": \"${REALITY_DEST}\"|" "${REALITY_CONF}"
+    sed -i "s|\"${cur_dest##*:}\"|\"${REALITY_SNI}\"|" "${REALITY_CONF}"
+    systemctl restart "${REALITY_SERVICE}"
+    sleep 1
+    if ! systemctl is-active --quiet "${REALITY_SERVICE}"; then
+        log_error "服务重启失败,回滚配置:"
+        sed -i "s|\"dest\": \"${REALITY_DEST}\"|\"dest\": \"${cur_dest}\"|" "${REALITY_CONF}"
+        sed -i "s|\"${REALITY_SNI}\"|\"${cur_dest##*:}\"|" "${REALITY_CONF}"
+        systemctl restart "${REALITY_SERVICE}"
+        journalctl -u "${REALITY_SERVICE}" --no-pager -n 10
+        return 1
+    fi
+
+    # 更新 info 文件并输出新链接: 直接从当前配置读全部参数生成 (不依赖 URL_FILE 历史条目)
+    local uuid cur_pubkey cur_sid
+    uuid="$(grep -o '"id": "[^"]*"' "${REALITY_CONF}" | head -1 | cut -d'"' -f4)"
+    # shortIds 是多行数组, 用 -A1 抓第一个值
+    cur_sid="$(grep -A1 '"shortIds"' "${REALITY_CONF}" | grep -o '"[0-9a-f]*"' | tr -d '"' | head -1)"
+    cur_pubkey="$(grep reality "${URL_FILE}" 2>/dev/null | tail -1 | grep -o 'pbk=[^&]*' | cut -d= -f2)"
+    if [[ -z "${cur_pubkey}" ]]; then
+        local privkey
+        privkey="$(grep -o '"privateKey": "[^"]*"' "${REALITY_CONF}" | cut -d'"' -f4)"
+        cur_pubkey="$("${NGINX_BIN:-/usr/local/bin/xray}" x25519 -i "${privkey}" 2>/dev/null | awk '/Public key|Password/{print $NF}')"
+    fi
+    local ip
+    ip="$(curl -4 -s --max-time 8 https://api.ip.sb/ip || curl -4 -s --max-time 8 https://api.ipify.org)"
+    ip="${ip//[$'\r\n']/}"
+    new_url="vless://${uuid}@${ip}:${cur_port}?type=tcp&security=reality&pbk=${cur_pubkey}&sid=${cur_sid}&sni=${REALITY_SNI}&fp=chrome&flow=xtls-rprx-vision&encryption=none#${REALITY_SNI}-reality"
+    echo "${new_url}" >> "${URL_FILE}"
+
+    echo
+    echo -e "${GREEN}==========================================${PLAIN}"
+    echo -e "${GREEN}   伪装站已更换 (UUID/端口/密钥不变)      ${PLAIN}"
+    echo -e "${GREEN}==========================================${PLAIN}"
+    echo -e " 新伪装站 : ${REALITY_DEST}"
+    echo -e " 新链接   : ${new_url}"
+    echo -e "${GREEN}==========================================${PLAIN}"
+    log_confirm "客户端只需把该节点的 SNI 改为 ${REALITY_SNI} (或删旧导新上面的链接)。"
+    log_confirm "同时请更新本地直连验证: 你所在网络需能正常访问 ${REALITY_SNI}。"
+}
+
 
 do_update_v2ray() {
     check_root
@@ -1893,7 +2012,8 @@ show_menu() {
     echo -e " 7. 查看已安装节点 / 导出全部分享链接"
     echo -e " 8. 手动续签 / 重新申请证书"
     echo -e " 9. 更新 V2Ray / Xray core"
-    echo -e "10. 卸载 (可选单模式或全部)"
+    echo -e "10. 更换 REALITY 伪装站 (保留 UUID/端口, 客户端只改 SNI)"
+    echo -e "11. 卸载 (可选单模式或全部)"
     echo -e " 0. 退出"
     echo
     read -rp "请选择: " choice || exit 0
@@ -1907,7 +2027,8 @@ show_menu() {
         7) do_show_info ;;
         8) do_renew_cert ;;
         9) do_update_v2ray ;;
-        10) do_uninstall ;;
+        10) do_change_reality_dest ;;
+        11) do_uninstall ;;
         0) exit 0 ;;
         *) ;;
     esac
