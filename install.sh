@@ -1218,11 +1218,15 @@ select_reality_dest_interactive() {
         echo "  $((i+1)). ${_ok[$i]%%|*}  (${_ok[$i]##*|}ms)"
     done
     echo "  c. 自定义其他域名 (自动校验 TLS1.3/H2, 达标才接受)"
+    echo "  q. 放弃 (更换场景下原配置不动)"
     echo
     echo "提示: 优先选与 VPS 同地区、你平时常访问的大站, 伪装更自然。"
     while :; do
-        read -rp "请输入编号 / c / 直接回车默认 [${_ok[0]%%|*}]: " pick || return 1
+        read -rp "请输入编号 / c 自定义 / q 放弃 / 直接回车默认 [${_ok[0]%%|*}]: " pick || return 1
         case "${pick}" in
+            q|Q)
+                return 1
+                ;;
             "")
                 REALITY_DEST="${_ok[0]%%|*}"
                 REALITY_SNI="${REALITY_DEST%%:*}"
@@ -1909,21 +1913,23 @@ do_change_reality_dest() {
         log_info "非交互模式,自动选用延迟最低的 ${REALITY_DEST} (${ok_dests[0]##*|}ms)"
     fi
 
-    # 终验 (失败回退: 剔除后重选, 逻辑与安装一致, 简化为最多重试 3 次换下一候选)
-    local tries=0
+    # 终验 (失败回退: 剔除失败项后回到选择菜单, 库里选或自定义均可, 直到通过或用户主动放弃)
     while ! check_reality_dest "${REALITY_DEST}" "${REALITY_SNI}"; do
-        tries=$((tries + 1))
-        log_error "目标站 ${REALITY_DEST} 终验未通过 (第 ${tries} 次)。"
-        (( tries >= 3 )) && { log_error "连续 3 次失败,放弃更换 (原配置未动)。"; return 1; }
+        log_error "目标站 ${REALITY_DEST} 终验未通过。"
+        # 从候选中剔除失败项
         local remain=() od
         for od in "${ok_dests[@]}"; do
             [[ "${od%%|*}" != "${REALITY_DEST}" ]] && remain+=("${od}")
         done
         ok_dests=("${remain[@]}")
-        (( ${#ok_dests[@]} == 0 )) && { log_error "无可用候选,放弃更换 (原配置未动)。"; return 1; }
-        REALITY_DEST="${ok_dests[0]%%|*}"
-        REALITY_SNI="${REALITY_DEST%%:*}"
-        log_info "自动切换到 ${REALITY_DEST} (${ok_dests[0]##*|}ms) 重试..."
+        if (( ${#ok_dests[@]} == 0 )); then
+            log_warn "预置候选已用完,请自定义输入目标站 (校验通过才接受)。"
+        fi
+        log_confirm "请重新选择目标站 (库里选编号 / c 自定义 / q 放弃更换):"
+        if ! select_reality_dest_interactive ok_dests; then
+            log_error "已放弃更换 (原配置未动)。"
+            return 1
+        fi
     done
 
     # 仅改 dest/sni, 保留 port/uuid/密钥/sid
