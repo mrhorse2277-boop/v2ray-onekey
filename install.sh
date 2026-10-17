@@ -1084,7 +1084,55 @@ do_install_socks() {
 
 # ---------- vless + REALITY 模式 (Xray core, 抗封锁首选, 无需域名/证书) ----------
 
-REALITY_DEFAULT_DESTS=("www.tesla.com:443" "www.microsoft.com:443" "www.samsung.com:443" "www.lovelive-anime.jp:443" "www.nvidia.com:443")
+# 候选目标站按地区分组:格式 "站点:端口|地区" (地区用于按 VPS 位置智能排序)
+# 选站原则: 大厂自有域名、支持 TLS1.3+H2、非 CDN 共享域、在当地访问质量好
+REALITY_DEST_POOL=(
+    # 香港
+    "www.hk01.com:443|香港"
+    "www.hket.com:443|香港"
+    # 台湾
+    "www.momoshop.com.tw:443|台湾"
+    "www.chinatimes.com:443|台湾"
+    # 新加坡
+    "www.singtel.com:443|新加坡"
+    "www.dbs.com:443|新加坡"
+    # 日本
+    "www.yahoo.co.jp:443|日本"
+    "www.rakuten.co.jp:443|日本"
+    "www.lovelive-anime.jp:443|日本"
+    # 韩国
+    "www.naver.com:443|韩国"
+    "www.samsung.com:443|韩国"
+    # 美国
+    "www.tesla.com:443|美国"
+    "www.microsoft.com:443|美国"
+    "www.nvidia.com:443|美国"
+    "www.cloudflare.com:443|美国"
+    # 欧洲
+    "www.bmw.de:443|德国"
+    "www.airbus.com:443|法国"
+    "www.ns.nl:443|荷兰"
+    "www.bbc.co.uk:443|英国"
+)
+
+# 获取 VPS 所在地区 (基于时区, 无外部依赖; 失败返回空)
+detect_vps_region() {
+    local tz
+    tz="$(timedatectl show -p Timezone --value 2>/dev/null)" || tz="$(cat /etc/timezone 2>/dev/null)" || tz=""
+    case "${tz}" in
+        Asia/Hong_Kong|Asia/Macau)              echo "香港" ;;
+        Asia/Taipei)                            echo "台湾" ;;
+        Asia/Singapore)                         echo "新加坡" ;;
+        Asia/Tokyo)                             echo "日本" ;;
+        Asia/Seoul)                             echo "韩国" ;;
+        America/New_York|America/Chicago|America/Denver|America/Los_Angeles|America/Phoenix) echo "美国" ;;
+        Europe/Berlin|Europe/Zurich|Europe/Vienna)  echo "德国" ;;
+        Europe/Paris|Europe/Brussels|Europe/Amsterdam) echo "法国" ;;
+        Europe/Amsterdam)                       echo "荷兰" ;;
+        Europe/London|Europe/Dublin)            echo "英国" ;;
+        *)                                      echo "" ;;
+    esac
+}
 
 # REALITY 目标站交互选择:
 #   1..N  从探测通过的候选站中挑选
@@ -1167,18 +1215,43 @@ do_install_reality() {
     fi
     record_port "${REALITY_PORT}"
 
-    # 探测候选池, 生成"可用目标站列表"
+    # 探测候选池: 按 VPS 所在地区智能排序 (同地区优先), 生成可用目标站列表
+    local vps_region
+    vps_region="$(detect_vps_region)"
+    local sorted_pool=()
+    local entry
+    # 同地区的排前面, 其余保持池内原顺序
+    for entry in "${REALITY_DEST_POOL[@]}"; do
+        [[ "${entry##*|}" == "${vps_region}" ]] && sorted_pool+=("${entry}")
+    done
+    for entry in "${REALITY_DEST_POOL[@]}"; do
+        [[ "${entry##*|}" != "${vps_region}" ]] && sorted_pool+=("${entry}")
+    done
+    if [[ -n "${vps_region}" ]]; then
+        log_info "检测到 VPS 位于 ${vps_region},同地区站点优先探测。"
+    fi
+
     local ok_dests=()
-    local d
-    for d in "${REALITY_DEFAULT_DESTS[@]}"; do
+    local probed=()
+    for entry in "${sorted_pool[@]}"; do
+        local d="${entry%%|*}"
+        local region="${entry##*|}"
         local s="${d%%:*}"
-        log_info "校验伪装目标站 ${d} ..."
+        # 已探测过则跳过 (池内有重复站点时)
+        local dup=0
+        local pd
+        for pd in "${probed[@]}"; do [[ "${pd}" == "${d}" ]] && dup=1; done
+        [[ "${dup}" == "1" ]] && continue
+        probed+=("${d}")
+        log_info "校验伪装目标站 ${d} (${region}) ..."
         if check_reality_dest "${d}" "${s}"; then
             log_info "  -> 可用"
             ok_dests+=("${d}")
         else
             log_info "  -> 不可用,跳过"
         fi
+        # 最多探测通过 8 个即可, 避免全池 20 站逐个探测拖太久
+        (( ${#ok_dests[@]} >= 8 )) && break
     done
 
     # 目标站选择: 交互模式列出可用候选让用户挑, 或自定义任意域名 (校验达标才接受);
@@ -1191,8 +1264,8 @@ do_install_reality() {
             REALITY_SNI="${REALITY_DEST%%:*}"
             log_info "非交互模式,自动选用 ${REALITY_DEST}"
         else
-            log_warn "所有预置目标站校验均未通过,使用 ${REALITY_DEFAULT_DESTS[0]} 兜底 (若后续连接异常请手动更换 dest/sni)。"
-            REALITY_DEST="${REALITY_DEFAULT_DESTS[0]}"
+            log_warn "所有预置目标站校验均未通过,使用 ${REALITY_DEST_POOL[0]%%|*} 兜底 (若后续连接异常请手动更换 dest/sni)。"
+            REALITY_DEST="${REALITY_DEST_POOL[0]%%|*}"
             REALITY_SNI="${REALITY_DEST%%:*}"
         fi
     fi
