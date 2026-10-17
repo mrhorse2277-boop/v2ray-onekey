@@ -1605,6 +1605,8 @@ build_share_link() {
         get_public_ip
         host="${PUBLIC_IP:-127.0.0.1}"
         SHARE_URL="socks://${b64cred}@${host}:${SOCKS_PORT}#$(url_encode "${CLIENT_REMARK}")"
+        # 附加格式: IP:端口:用户:密码{备注} (部分代理工具的导入格式)
+        SHARE_URL_PLAIN="${host}:${SOCKS_PORT}:${SOCKS_USER}:${SOCKS_PASS}{${CLIENT_REMARK}}"
         return
     fi
 
@@ -1728,12 +1730,14 @@ show_mode_info() {
         [[ "${MODE}" == "ws" ]] && echo -e " 伪装站点    : https://${DOMAIN}"
     fi
     echo -e " 分享链接    : ${SHARE_URL}"
+    [[ -n "${SHARE_URL_PLAIN:-}" ]] && echo -e " 工具格式    : ${SHARE_URL_PLAIN}"
     echo -e "${GREEN}==========================================${PLAIN}"
 
     append_info "$([[ "${PROTOCOL}" ]] && echo "${PROTOCOL}+${MODE}" || echo "${MODE}")"
 
     # 追加到总链接文件
     echo "${SHARE_URL}" >> "${URL_FILE}"
+    [[ -n "${SHARE_URL_PLAIN:-}" ]] && echo "${SHARE_URL_PLAIN}" >> "${URL_FILE}"
 
     if command -v qrencode >/dev/null 2>&1; then
         echo -e "${BLUE}客户端扫码导入:${PLAIN}"
@@ -2129,6 +2133,7 @@ do_reset_node() {
         echo -e " - ${c}"
     done
     echo -e " 新链接   : ${SHARE_URL}"
+    [[ -n "${SHARE_URL_PLAIN:-}" ]] && echo -e " 工具格式 : ${SHARE_URL_PLAIN}"
     echo -e "${GREEN}==========================================${PLAIN}"
     log_confirm "客户端请删除旧节点并导入上面的新链接 (旧链接已失效)。"
 }
