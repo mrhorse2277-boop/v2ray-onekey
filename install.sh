@@ -2443,6 +2443,11 @@ do_reset_reality() {
     if ! systemctl is-active --quiet "${REALITY_SERVICE}"; then
         log_error "服务重启失败,回滚配置:"
         mv "${REALITY_CONF}.bak" "${REALITY_CONF}"
+        # 回滚端口记录: 新端口已记录、旧端口已删除, 与配置恢复保持一致
+        if [[ "${reset_port}" == "1" ]]; then
+            unrecord_port "${new_port:-0}"
+            record_port "${old_port}"
+        fi
         systemctl restart "${REALITY_SERVICE}"
         journalctl -u "${REALITY_SERVICE}" --no-pager -n 10
         return 1
@@ -2492,7 +2497,7 @@ do_reset_node() {
         read -rp "请选择: " mode_pick || return
 
         local conf svc svc_label port_var old_port new_port new_uuid new_user new_pass
-        local is_socks=0
+        local is_socks=0 new_internal=""
         case "${mode_pick}" in
             1) conf="${WS_CONF}";   svc="${WS_SERVICE}";   svc_label="ws+tls" ;;
             2) conf="${H2_CONF}";   svc="${H2_SERVICE}";   svc_label="h2+tls" ;;
@@ -2607,7 +2612,8 @@ do_reset_node() {
                     INTERNAL_PORT="${new_internal}"
                     WS_PORT="${new_ws_port}"
                     record_port "${new_internal}"
-                    unrecord_port "$(grep -o '"port": [0-9]*' "${conf}.bak" | head -1 | grep -o '[0-9]*')"
+                    # 旧内部端口与新端口相同时 (如手工改过配置致 sed 未命中) 不删, 防误删在用记录
+                    [[ "${old_port}" != "${new_port}" ]] && unrecord_port "${old_port}"
                     log_info "ws 模式: 对外监听端口 ${old_ws_port} -> ${new_ws_port} (nginx 配置将一并 reload)。"
                 fi
             else
@@ -2639,6 +2645,14 @@ do_reset_node() {
         mv "${conf}.bak" "${conf}"
         if [[ "${mode_pick}" == "1" && "${reset_port:-0}" == "1" ]]; then
             sed -i "s|proxy_pass http://127.0.0.1:[0-9]*;|proxy_pass http://127.0.0.1:${old_port};|" "${WS_NGINX_CONF}"
+            # 独立端口部署时 listen 行已被改成新端口, 一并还原
+            sed -i "s|listen ${new_port} ssl|listen ${old_ws_port} ssl|; s|listen \[::\]:${new_port}|listen [::]:${old_ws_port}|" "${WS_NGINX_CONF}" 2>/dev/null || true
+        fi
+        # 回滚端口记录 (ws 独立端口场景记录了外部+内部两个新端口)
+        if [[ "${reset_port:-0}" == "1" ]]; then
+            unrecord_port "${new_port:-0}"
+            [[ -n "${new_internal:-}" ]] && unrecord_port "${new_internal}"
+            record_port "${old_port}"
         fi
         systemctl restart "${svc}"
         journalctl -u "${svc}" --no-pager -n 10
@@ -2655,7 +2669,12 @@ do_reset_node() {
             mv "${conf}.bak" "${conf}"
             if [[ "${mode_pick}" == "1" ]]; then
                 sed -i "s|proxy_pass http://127.0.0.1:[0-9]*;|proxy_pass http://127.0.0.1:${old_port};|" "${WS_NGINX_CONF}"
+                [[ "${old_ws_port:-}" != "${new_port}" ]] && sed -i "s|listen ${new_port} ssl|listen ${old_ws_port} ssl|; s|listen \[::\]:${new_port}|listen [::]:${old_ws_port}|" "${WS_NGINX_CONF}" 2>/dev/null || true
             fi
+            # 回滚端口记录 (ws 独立端口场景记录了外部+内部两个新端口)
+            unrecord_port "${new_port:-0}"
+            [[ -n "${new_internal:-}" ]] && unrecord_port "${new_internal}"
+            record_port "${old_port}"
             systemctl restart "${svc}"
             journalctl -u "${svc}" --no-pager -n 10
             return 1
@@ -2804,6 +2823,10 @@ do_change_reality_dest() {
     if [[ -t 0 ]]; then
         select_reality_dest_interactive ok_dests
     else
+        if (( ${#ok_dests[@]} == 0 )); then
+            log_error "候选池为空 (所有预置目标站均不可达),已放弃更换 (原配置未动)。"
+            return 1
+        fi
         REALITY_DEST="${ok_dests[0]%%|*}"
         REALITY_SNI="${REALITY_DEST%%:*}"
         log_info "非交互模式,自动选用延迟最低的 ${REALITY_DEST} (${ok_dests[0]##*|}ms)"
@@ -2856,7 +2879,7 @@ do_change_reality_dest() {
     if [[ -z "${cur_pubkey}" ]]; then
         local privkey
         privkey="$(grep -o '"privateKey": "[^"]*"' "${REALITY_CONF}" | cut -d'"' -f4)"
-        cur_pubkey="$("${NGINX_BIN:-/usr/local/bin/xray}" x25519 -i "${privkey}" 2>/dev/null | awk '/Public key|Password/{print $NF}')"
+        cur_pubkey="$(xray x25519 -i "${privkey}" 2>/dev/null | awk '/Public key|Password/{print $NF}')"
     fi
     local ip
     ip="$(curl -4 -s --max-time 8 https://api.ip.sb/ip || curl -4 -s --max-time 8 https://api.ipify.org)"
