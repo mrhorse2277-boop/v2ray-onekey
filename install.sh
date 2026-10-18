@@ -1240,10 +1240,10 @@ do_install_socks() {
 #           且必须"大陆可正常访问" —— 被墙站作 SNI 会触发 GFW 的 SNI 级回程阻断 (实战教训)
 # 每地区 3 个, 全部经真实探测 (TLS1.3+H2) 与 GFW 列表双重校验 (2026-10)
 REALITY_DEST_POOL=(
-    # 香港 (大陆可达)
-    "www.hkjc.com:443|香港"
+    # 香港 (大陆可达; hkjc 实战曾触发 SNI 回程阻断, 已移除)
     "www.octopus.com.hk:443|香港"
     "www.cathaypacific.com:443|香港"
+    "www.hkex.com.hk:443|香港"
     # 台湾 (大陆可达; 台湾金融/媒体站多无 H2 或被墙, 用科技大厂)
     "www.tsmc.com:443|台湾"
     "www.mediatek.com:443|台湾"
