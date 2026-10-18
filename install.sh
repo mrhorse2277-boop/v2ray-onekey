@@ -75,7 +75,8 @@ XRAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/XTLS/Xray-install/main/in
 INFO_FILE="${V2RAY_CONF_DIR}/v2ray_info.txt"
 URL_FILE="/root/v2ray_share_url.txt"
 
-DOMAIN=""
+# DOMAIN 支持环境变量预设 (非交互安装), 交互模式下仍会提示输入
+DOMAIN="${DOMAIN:-}"
 MODE=""                 # ws | h2 | socks | reality
 PROTOCOL=""             # vmess | vless (socks/reality 模式下为空/固定)
 UUID=""
@@ -862,8 +863,12 @@ EOF
 
 do_install_ws() {
     echo
-    log_confirm "请输入你的域名 (例如 www.example.com,必须已解析 A 记录到本机):"
-    read -rp "域名: " DOMAIN
+    if [[ -n "${DOMAIN}" ]]; then
+        log_info "使用预设域名 (环境变量 DOMAIN): ${DOMAIN}"
+    else
+        log_confirm "请输入你的域名 (例如 www.example.com,必须已解析 A 记录到本机):"
+        read -rp "域名: " DOMAIN
+    fi
     DOMAIN="${DOMAIN//[$'\r\n']/}"
     DOMAIN="${DOMAIN,,}"
     if [[ -z "${DOMAIN}" ]] || ! check_domain "${DOMAIN}"; then
@@ -1038,8 +1043,12 @@ EOF
 
 do_install_h2() {
     echo
-    log_confirm "请输入你的域名 (h2 需要 TLS 证书,必须已解析 A 记录到本机):"
-    read -rp "域名: " DOMAIN
+    if [[ -n "${DOMAIN}" ]]; then
+        log_info "使用预设域名 (环境变量 DOMAIN): ${DOMAIN}"
+    else
+        log_confirm "请输入你的域名 (h2 需要 TLS 证书,必须已解析 A 记录到本机):"
+        read -rp "域名: " DOMAIN
+    fi
     DOMAIN="${DOMAIN//[$'\r\n']/}"
     DOMAIN="${DOMAIN,,}"
     if [[ -z "${DOMAIN}" ]] || ! check_domain "${DOMAIN}"; then
@@ -1737,6 +1746,21 @@ EOF
 
 append_info() {
     local section="$1"
+    # 同名段落已存在 (同模式重装) 时先删除旧段落, 避免菜单 7 出现重复/过期条目
+    # 多个同名段落时循环删除直至清零
+    if [[ -f "${INFO_FILE}" ]] && grep -q "^### ${section}$" "${INFO_FILE}"; then
+        local tmp="${INFO_FILE}.dedup.$$"
+        local dedup_body='
+            $0 == s {skip=1; next}
+            skip && /^### / {skip=0}
+            skip && /^$/ {skip=0; next}
+            !skip
+        '
+        while grep -q "^### ${section}$" "${INFO_FILE}"; do
+            awk -v s="### ${section}" "${dedup_body}" "${INFO_FILE}" \
+                | sed '/./,/^$/!d' > "${tmp}" && mv -f "${tmp}" "${INFO_FILE}"
+        done
+    fi
     {
         echo "### ${section}"
         echo "share_url=${SHARE_URL}"
@@ -2185,10 +2209,27 @@ do_reset_node() {
             new_port="$(gen_port "${V2RAY_CONF_DIR}/used_ports.txt")"
             sed -i "s/\"port\": ${old_port},/\"port\": ${new_port},/" "${conf}"
             if [[ "${mode_pick}" == "1" ]]; then
-                # ws 模式: 配置内部端口 + nginx 反代目标端口都要改
-                sed -i "s|proxy_pass http://127.0.0.1:${old_port};|proxy_pass http://127.0.0.1:${new_port};|" "${WS_NGINX_CONF}"
-                INTERNAL_PORT="${new_port}"
-                log_info "ws 模式: nginx 反代目标已同步更新为 ${new_port} (nginx 配置将一并 reload)。"
+                # ws 模式: 客户端连接的是 nginx 监听端口, "更换端口"应作用于它;
+                # 443 并入式部署 (nginx 已占 443) 只换内部端口, 对外仍走 443
+                local old_ws_port new_ws_port
+                old_ws_port="$(grep -m1 -oE "listen [0-9]+ ssl" "${WS_NGINX_CONF}" | grep -o "[0-9]*")"
+                old_ws_port="${old_ws_port:-443}"
+                if [[ "${old_ws_port}" == "443" ]]; then
+                    INTERNAL_PORT="${new_port}"
+                    sed -i "s|proxy_pass http://127.0.0.1:${old_port};|proxy_pass http://127.0.0.1:${new_port};|" "${WS_NGINX_CONF}"
+                    log_info "ws 模式: 对外端口仍为 443 (nginx 并入), v2ray 内部端口已更新为 ${new_port}。"
+                else
+                    new_ws_port="${new_port}"
+                    local new_internal
+                    new_internal="$(gen_port "${V2RAY_CONF_DIR}/used_ports.txt")"
+                    sed -i "s/\"port\": ${new_port},/\"port\": ${new_internal},/" "${conf}"
+                    sed -i "s|proxy_pass http://127.0.0.1:${old_port};|proxy_pass http://127.0.0.1:${new_internal};|" "${WS_NGINX_CONF}"
+                    sed -i "s|listen ${old_ws_port} ssl|listen ${new_ws_port} ssl|; s|listen \[::\]:${old_ws_port} ssl|listen [::]:${new_ws_port} ssl|" "${WS_NGINX_CONF}"
+                    INTERNAL_PORT="${new_internal}"
+                    WS_PORT="${new_ws_port}"
+                    record_port "${new_internal}"
+                    log_info "ws 模式: 对外监听端口 ${old_ws_port} -> ${new_ws_port} (nginx 配置将一并 reload)。"
+                fi
             else
                 H2_PORT="${new_port}"
                 INTERNAL_PORT="${new_port}"
@@ -2237,10 +2278,12 @@ do_reset_node() {
         CLIENT_REMARK="${CLIENT_REMARK:-socks5-node}"
     else
         MODE="${mode_pick}"; PROTOCOL="vless"
-        # 域名/路径/端口全部从 info 文件与当前配置恢复 (与实际部署一致, 不依赖本次会话状态)
+        # 实际安装协议可能为 vmess (安装时决定), 从 info 段落名恢复, 保持段落名不变
         local section_key="${svc_label%%+*}"
         local infoblock
         infoblock="$(awk -v s="### .*${section_key}" 'BEGIN{IGNORECASE=0} $0 ~ s {f=1} f && /^### / && $0 !~ s {f=0} f' "${INFO_FILE}" 2>/dev/null)"
+        PROTOCOL="$(grep -m1 '^### ' <<< "${infoblock}" | grep -o '^### \(vmess\|vless\)' | cut -d' ' -f2)"
+        PROTOCOL="${PROTOCOL:-vless}"
         DOMAIN="$(echo "${infoblock}" | grep "^domain=" | tail -1 | cut -d= -f2)"
         [[ -z "${DOMAIN}" ]] && DOMAIN="$(grep "^domain=" "${INFO_FILE}" 2>/dev/null | tail -1 | cut -d= -f2)"
         WS_PATH="$(grep -o '"path": "/[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
@@ -2257,6 +2300,7 @@ do_reset_node() {
     fi
     build_share_link
     echo "${SHARE_URL}" >> "${URL_FILE}"
+    sync_info_block "$([[ "${MODE}" == "socks" ]] && echo "socks" || echo "${PROTOCOL}+${svc_label%%+*}")" "${SHARE_URL}"
 
     echo
     echo -e "${GREEN}==========================================${PLAIN}"
@@ -2270,6 +2314,37 @@ do_reset_node() {
     [[ -n "${SHARE_URL_PLAIN:-}" ]] && echo -e " 工具格式 : ${SHARE_URL_PLAIN}"
     echo -e "${GREEN}==========================================${PLAIN}"
     log_confirm "客户端请删除旧节点并导入上面的新链接 (旧链接已失效)。"
+}
+
+# 重置后同步 INFO_FILE 对应段落 (端口/UUID/凭据), 保持菜单 7 与导出一致
+sync_info_block() {
+    local section="$1" new_share_url="$2"
+    [[ ! -f "${INFO_FILE}" ]] && return
+    if ! grep -q "^### ${section}$" "${INFO_FILE}"; then
+        append_info "${section}"
+        return
+    fi
+    local tmp="${INFO_FILE}.tmp.$$"
+    awk -v s="### ${section}" -v newurl="share_url=${new_share_url}" '
+        $0 == s {inblk=1}
+        inblk && /^share_url=/ {print newurl; inblk=2; next}
+        inblk == 2 && /^port=/ {
+            if (mode == "socks") print "port=" socks_port
+            else if (mode == "h2") print "port=" h2_port
+            else if (mode == "reality") print "port=" reality_port
+            else print "port=" ws_port
+            next
+        }
+        inblk == 2 && /^uuid=/ {print "uuid=" uuid; next}
+        inblk == 2 && /^socks_user=/ {print "socks_user=" socks_user; next}
+        inblk == 2 && /^socks_pass=/ {print "socks_pass=" socks_pass; next}
+        inblk == 2 && /^### / {inblk=0}
+        {print}
+    ' mode="${MODE}" socks_port="${SOCKS_PORT:-}" h2_port="${H2_PORT:-}" ws_port="${WS_PORT:-443}" \
+      reality_port="${REALITY_PORT:-}" uuid="${UUID:-}" \
+      socks_user="${SOCKS_USER:-}" socks_pass="${SOCKS_PASS:-}" \
+      "${INFO_FILE}" > "${tmp}" && mv -f "${tmp}" "${INFO_FILE}"
+    chmod 600 "${INFO_FILE}"
 }
 
 # 仅更换 REALITY 伪装目标站: 保留 UUID/端口/密钥, 只改 dest+sni, 客户端只需更新 sni 字段
