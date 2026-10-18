@@ -2333,7 +2333,10 @@ do_reset_node() {
                     if ! grep -q "proxy_pass http://127.0.0.1:${new_internal};" "${WS_NGINX_CONF}"; then
                         sed -i "s|proxy_pass http://127.0.0.1:[0-9]*;|proxy_pass http://127.0.0.1:${new_internal};|" "${WS_NGINX_CONF}"
                     fi
-                    sed -i "s|listen ${old_ws_port} ssl|listen ${new_ws_port} ssl|; s|listen \[::\]:${old_ws_port} ssl|listen [::]:${new_ws_port} ssl|" "${WS_NGINX_CONF}"
+                    # listen 行有两种格式: 旧版 "listen <p> ssl http2;" / "listen [::]:<p> ssl http2;",
+                    # nginx >=1.25.1 "listen <p> ssl;" / "listen [::]:<p);" (http2 独立指令)。
+                    # IPv4 行固定有 ssl 后缀, IPv6 行可能没有, 两种变体都要替换。
+                    sed -i "s|listen ${old_ws_port} ssl|listen ${new_ws_port} ssl|; s|listen \[::\]:${old_ws_port}|listen [::]:${new_ws_port}|" "${WS_NGINX_CONF}"
                     INTERNAL_PORT="${new_internal}"
                     WS_PORT="${new_ws_port}"
                     record_port "${new_internal}"
