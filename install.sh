@@ -2153,6 +2153,11 @@ do_reset_reality() {
     local new_url
     new_url="$(build_reality_link_from_conf)"
     echo "${new_url}" >> "${URL_FILE}"
+    # 同步 INFO_FILE 的 reality 段落 (端口/UUID/链接), 保持菜单 7 与导出一致
+    REALITY_PORT="$(grep -o '"port": [0-9]*' "${REALITY_CONF}" | head -1 | grep -o '[0-9]*')"
+    UUID="$(grep -o '"id": "[^"]*"' "${REALITY_CONF}" | head -1 | cut -d'"' -f4)"
+    MODE="reality"
+    sync_info_block "vless+reality" "${new_url}"
 
     echo
     echo -e "${GREEN}==========================================${PLAIN}"
@@ -2516,6 +2521,10 @@ do_change_reality_dest() {
     ip="${ip//[$'\r\n']/}"
     new_url="vless://${uuid}@${ip}:${cur_port}?type=tcp&security=reality&pbk=${cur_pubkey}&sid=${cur_sid}&sni=${REALITY_SNI}&fp=chrome&flow=xtls-rprx-vision&encryption=none#${REALITY_SNI}-reality"
     echo "${new_url}" >> "${URL_FILE}"
+    # 同步 INFO_FILE 的 dest/sni/share_url
+    MODE="reality"; REALITY_PORT="${cur_port}"; UUID="${uuid}"
+    sync_info_block "vless+reality" "${new_url}"
+    sed -i "/### vless+reality/,/^$/ { s|^dest=.*|dest=${REALITY_DEST}|; s|^sni=.*|sni=${REALITY_SNI}|; }" "${INFO_FILE}"
 
     echo
     echo -e "${GREEN}==========================================${PLAIN}"
