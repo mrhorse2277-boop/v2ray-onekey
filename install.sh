@@ -2065,6 +2065,15 @@ EOF
 
 # ---------- 信息展示 ----------
 
+# 分享链接二维码 (ANSI 终端直接渲染, qrencode 未装时静默跳过)
+show_qr() {
+    local url="$1"
+    [[ -z "${url}" ]] && return 0
+    command -v qrencode >/dev/null 2>&1 || return 0
+    echo -e "${BLUE}客户端扫码导入:${PLAIN}"
+    echo "${url}" | qrencode -t ANSIUTF8
+}
+
 append_info() {
     local section="$1"
     # 同名段落已存在 (同模式重装) 时先删除旧段落, 避免菜单 7 出现重复/过期条目
@@ -2607,6 +2616,7 @@ do_reset_reality() {
     done
     echo -e " 新链接   : ${new_url}"
     echo -e "${GREEN}==========================================${PLAIN}"
+    show_qr "${new_url}"
     log_confirm "客户端请删除旧节点并导入上面的新链接 (旧链接已失效)。"
 }
 
@@ -2857,6 +2867,7 @@ do_reset_node() {
     echo -e " 新链接   : ${SHARE_URL}"
     [[ -n "${SHARE_URL_PLAIN:-}" ]] && echo -e " 工具格式 : ${SHARE_URL_PLAIN}"
     echo -e "${GREEN}==========================================${PLAIN}"
+    show_qr "${SHARE_URL}"
     log_confirm "客户端请删除旧节点并导入上面的新链接 (旧链接已失效)。"
 }
 
@@ -3029,6 +3040,7 @@ do_change_reality_dest() {
     echo -e " 新伪装站 : ${REALITY_DEST}"
     echo -e " 新链接   : ${new_url}"
     echo -e "${GREEN}==========================================${PLAIN}"
+    show_qr "${new_url}"
     log_confirm "客户端只需把该节点的 SNI 改为 ${REALITY_SNI} (或删旧导新上面的链接)。"
     log_confirm "同时请更新本地直连验证: 你所在网络需能正常访问 ${REALITY_SNI}。"
 }
