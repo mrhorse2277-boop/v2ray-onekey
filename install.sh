@@ -2166,60 +2166,189 @@ show_mode_info() {
 
 do_show_info() {
     get_public_ip
-    if [[ ! -f "${INFO_FILE}" ]]; then
-        log_warn "未找到已安装的配置信息 (${INFO_FILE})。"
+    local any=0
+    local out_lines=() exported=()
+    # 全部参数从实际配置文件现场提取 (不信任 INFO_FILE/URL_FILE 历史记录:
+    # 手工改过配置、或任何历史 bug 都可能让记录陈旧), 每次运行重建导出文件,
+    # 保证导出的链接与磁盘上的真实配置一致
+    local p ip proto section lines=() k v
+    ip="${PUBLIC_IP:-127.0.0.1}"
+
+    # --- REALITY: 全部参数在 config_reality.json ---
+    if [[ -f "${REALITY_CONF}" ]]; then
+        any=1
+        p="$(grep -o '"port": [0-9]*' "${REALITY_CONF}" | head -1 | grep -o '[0-9]*')"
+        local r_uuid r_sni r_sid r_pbk r_priv
+        r_uuid="$(grep -o '"id": "[^"]*"' "${REALITY_CONF}" | head -1 | cut -d'"' -f4)"
+        r_sni="$(grep -A1 '"serverNames"' "${REALITY_CONF}" | grep -o '"[^"]*"' | tr -d '"' | sed -n 2p)"
+        r_sid="$(grep -A1 '"shortIds"' "${REALITY_CONF}" | grep -o '"[0-9a-f]*"' | tr -d '"' | head -1)"
+        r_priv="$(grep -o '"privateKey": "[^"]*"' "${REALITY_CONF}" | cut -d'"' -f4)"
+        r_pbk="$(xray x25519 -i "${r_priv}" 2>/dev/null | awk '/Public key|Password/{print $NF}')"
+        # 私钥推导失败才回退沿用历史链接的 pbk (此时提示可能不可用)
+        if [[ -z "${r_pbk}" ]]; then
+            r_pbk="$(grep reality "${URL_FILE}" 2>/dev/null | tail -1 | grep -o 'pbk=[^&]*' | cut -d= -f2)"
+        fi
+        local r_url
+        r_url="vless://${r_uuid}@${ip}:${p}?type=tcp&security=reality&pbk=${r_pbk}&sid=${r_sid}&sni=${r_sni}&fp=chrome&flow=xtls-rprx-vision&encryption=none#${r_sni}-reality"
+        out_lines+=("${GREEN}--- vless+REALITY ---${PLAIN}"
+            " 地址        : ${ip}"
+            " 端口        : ${p}"
+            " 用户 ID     : ${r_uuid}"
+            " 伪装目标    : $(grep -o '"dest": "[^"]*"' "${REALITY_CONF}" | head -1 | cut -d'"' -f4) (sni: ${r_sni})"
+            " 公钥 pbk    : ${r_pbk}"
+            " shortId sid : ${r_sid}"
+            " 分享链接: ${r_url}")
+        exported+=("${r_url}")
+    fi
+
+    # --- socks5: 全部参数在 config_socks.json ---
+    if [[ -f "${SOCKS_CONF}" ]]; then
+        any=1
+        p="$(grep -o '"port": [0-9]*' "${SOCKS_CONF}" | head -1 | grep -o '[0-9]*')"
+        local s_user s_pass s_b64
+        s_user="$(grep -o '"user": "[^"]*"' "${SOCKS_CONF}" | cut -d'"' -f4)"
+        s_pass="$(grep -o '"pass": "[^"]*"' "${SOCKS_CONF}" | cut -d'"' -f4)"
+        s_b64=$(printf '%s' "${s_user}:${s_pass}" | openssl base64 -A | tr -d '=' | tr '+/' '-_')
+        local s_url s_plain
+        s_url="socks://${s_b64}@${ip}:${p}#socks5-${ip}"
+        s_plain="${ip}:${p}:${s_user}:${s_pass}{socks5-${ip}}"
+        out_lines+=("${GREEN}--- socks5 ---${PLAIN}"
+            " 地址        : ${ip}"
+            " 端口        : ${p}"
+            " 用户名      : ${s_user}"
+            " 密码        : ${s_pass}"
+            " 分享链接: ${s_url}"
+            " 工具格式: ${s_plain}")
+        exported+=("${s_url}" "${s_plain}")
+    fi
+
+    # --- ws / h2: 域名从 nginx server_name 或证书 SAN 推导, 端口/uuid/path 从各自配置 ---
+    local m mode_label conf svc nginx_listen
+    for m in ws h2; do
+        if [[ "${m}" == "ws" ]]; then
+            conf="${WS_CONF}"; mode_label="ws+tls"; svc="${WS_SERVICE}"
+        else
+            conf="${H2_CONF}"; mode_label="h2+tls"; svc="${H2_SERVICE}"
+        fi
+        [[ -f "${conf}" ]] || continue
+        any=1
+        local m_uuid m_path m_port m_domain
+        m_uuid="$(grep -o '"id": "[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
+        m_path="$(grep -o '"path": "/[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
+        m_path="${m_path#/}"
+        if [[ "${m}" == "ws" ]]; then
+            # 客户端连接端口是 nginx 监听端口 (443 并入式部署时内部端口 ≠ 对外端口)
+            if [[ -f "${WS_NGINX_CONF}" ]]; then
+                m_port="$(grep -m1 -oE "listen [0-9]+ ssl" "${WS_NGINX_CONF}" | grep -o "[0-9]*")"
+                m_port="${m_port:-443}"
+                # 域名: 同一 vhost 的 server_name (首个, 排除 _)
+                m_domain="$(grep -m1 "server_name" "${WS_NGINX_CONF}" | awk '{print $2}' | tr -d ';')"
+            else
+                m_port="443"; m_domain=""
+            fi
+        else
+            m_port="$(grep -o '"port": [0-9]*' "${conf}" | head -1 | grep -o '[0-9]*')"
+            m_domain=""
+        fi
+        if [[ -z "${m_domain}" ]]; then
+            # 域名兜底: 证书 SAN (h2 或 nginx conf 缺 server_name 时)
+            m_domain="$(openssl x509 -in "${CRT_FILE}" -noout -ext subjectAltName 2>/dev/null \
+                | grep -o 'DNS:[^,]*' | head -1 | cut -d: -f2)"
+        fi
+        out_lines+=("${GREEN}--- ${mode_label} ---${PLAIN}"
+            " 域名        : ${m_domain:-未知 (证书未找到)}"
+            " 端口        : ${m_port}"
+            " 用户 ID     : ${m_uuid}"
+            " 路径        : /${m_path}")
+        if [[ -n "${m_domain}" && -n "${m_uuid}" ]]; then
+            local enc_path m_url
+            enc_path="$(url_encode "/${m_path}")"
+            if [[ "${m}" == "ws" ]]; then
+                # 协议按配置实际值生成对应格式链接 (vless URI / vmess v2 JSON)
+                proto="$(grep -o '"protocol": "[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
+                if [[ "${proto}" == "vmess" ]]; then
+                    local j b64
+                    j=$(cat <<EOF
+{
+  "v": "2",
+  "ps": "${m_domain}-vmess-ws",
+  "add": "${m_domain}",
+  "port": "${m_port}",
+  "id": "${m_uuid}",
+  "aid": "0",
+  "scy": "auto",
+  "net": "ws",
+  "type": "none",
+  "host": "${m_domain}",
+  "path": "/${m_path}",
+  "tls": "tls",
+  "sni": "${m_domain}",
+  "alpn": "",
+  "fp": "chrome"
+}
+EOF
+)
+                    b64=$(printf '%s' "${j}" | openssl base64 -A | tr -d '=' | tr '+/' '-_')
+                    m_url="vmess://${b64}"
+                else
+                    m_url="vless://${m_uuid}@${m_domain}:${m_port}?type=ws&security=tls&host=${m_domain}&path=${enc_path}&sni=${m_domain}&fp=chrome&encryption=none#${m_domain}-ws"
+                fi
+            else
+                m_url="vless://${m_uuid}@${m_domain}:${m_port}?type=h2&security=tls&host=${m_domain}&path=${enc_path}&sni=${m_domain}&fp=chrome&encryption=none#${m_domain}-h2"
+                proto="$(grep -o '"protocol": "[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
+                if [[ "${proto}" == "vmess" ]]; then
+                    local j2 b642
+                    j2=$(cat <<EOF
+{
+  "v": "2",
+  "ps": "${m_domain}-vmess-h2",
+  "add": "${m_domain}",
+  "port": "${m_port}",
+  "id": "${m_uuid}",
+  "aid": "0",
+  "scy": "auto",
+  "net": "h2",
+  "type": "none",
+  "host": "${m_domain}",
+  "path": "/${m_path}",
+  "tls": "tls",
+  "sni": "${m_domain}",
+  "alpn": "h2",
+  "fp": "chrome"
+}
+EOF
+)
+                    b642=$(printf '%s' "${j2}" | openssl base64 -A | tr -d '=' | tr '+/' '-_')
+                    m_url="vmess://${b642}"
+                else
+                    m_url="vless://${m_uuid}@${m_domain}:${m_port}?type=h2&security=tls&host=${m_domain}&path=${enc_path}&sni=${m_domain}&fp=chrome&encryption=none#${m_domain}-h2"
+                fi
+            fi
+            out_lines+=(" 分享链接: ${m_url}")
+            exported+=("${m_url}")
+        fi
+    done
+
+    if [[ "${any}" == "0" ]]; then
+        log_warn "未找到任何已安装模式的配置。"
         return
     fi
+
     clear
-    echo -e "${GREEN}================ 已安装节点 ================${PLAIN}"
-    local section="" line url=""
-    while IFS= read -r line; do
-        case "${line}" in
-            "### "*)
-                if [[ -n "${url}" ]]; then
-                    echo -e " 分享链接: ${url}"
-                    echo
-                    echo "${url}" >> "${URL_FILE}"
-                fi
-                section="${line#\#\# }"
-                url=""
-                echo -e "${GREEN}--- ${section} ---${PLAIN}"
-                ;;
-            share_url=*) url="${line#share_url=}" ;;
-            socks_user=*) socks_user="${line#*=}"; printf ' %-9s: %s
-' "socks_user" "${socks_user}" ;;
-            socks_pass=*)
-                socks_pass="${line#*=}"
-                printf ' %-9s: %s
-' "socks_pass" "${socks_pass}"
-                ;;
-            domain=*)
-                socks_user=""; socks_pass=""; socks_port=""
-                printf ' %-9s: %s
-' "domain" "${line#*=}" ;;
-            port=*)
-                socks_port="${line#*=}"
-                printf ' %-9s: %s
-' "port" "${socks_port}" ;;
-            uuid=*|path=*|address=*|dest=*|sni=*)
-                local _k="${line%%=*}" _v="${line#*=}"
-                printf ' %-9s: %s
-' "${_k}" "${_v}"
-                ;;
-        esac
-    done < "${INFO_FILE}"
-    if [[ -n "${url}" ]]; then
-        echo -e " 分享链接: ${url}"
-        echo "${url}" >> "${URL_FILE}"
-        if [[ -n "${socks_user:-}" && -n "${socks_pass:-}" && "${url}" == socks://* ]]; then
-            get_public_ip
-            local plain="${PUBLIC_IP}:${socks_port:-}:${socks_user}:${socks_pass}{socks5-${PUBLIC_IP}}"
-            echo -e " 工具格式: ${plain}"
-            echo "${plain}" >> "${URL_FILE}"
-        fi
-    fi
+    echo -e "${GREEN}================ 已安装节点 (实时读取配置) ================${PLAIN}"
+    local ol
+    for ol in "${out_lines[@]}"; do
+        echo -e "${ol}"
+    done
     echo -e "${GREEN}=============================================${PLAIN}"
-    log_confirm "全部分享链接已导出到: ${URL_FILE}"
+    # 导出文件每次重建 (而非追加): 只含当前真实配置对应的链接, 旧链接不入文件
+    {
+        local ex
+        for ex in "${exported[@]}"; do
+            echo "${ex}"
+        done
+    } > "${URL_FILE}"
+    log_confirm "全部分享链接已导出到: ${URL_FILE} (每次运行重建, 保证与当前配置一致)"
 }
 
 # ---------- 卸载 ----------
@@ -2875,11 +3004,13 @@ do_change_reality_dest() {
     uuid="$(grep -o '"id": "[^"]*"' "${REALITY_CONF}" | head -1 | cut -d'"' -f4)"
     # shortIds 是多行数组, 用 -A1 抓第一个值
     cur_sid="$(grep -A1 '"shortIds"' "${REALITY_CONF}" | grep -o '"[0-9a-f]*"' | tr -d '"' | head -1)"
-    cur_pubkey="$(grep reality "${URL_FILE}" 2>/dev/null | tail -1 | grep -o 'pbk=[^&]*' | cut -d= -f2)"
+    # pbk 必须与配置内私钥配对, 私钥推导优先; URL_FILE 历史值只作推导失败的兜底
+    local privkey
+    privkey="$(grep -o '"privateKey": "[^"]*"' "${REALITY_CONF}" | cut -d'"' -f4)"
+    cur_pubkey="$(xray x25519 -i "${privkey}" 2>/dev/null | awk '/Public key|Password/{print $NF}')"
     if [[ -z "${cur_pubkey}" ]]; then
-        local privkey
-        privkey="$(grep -o '"privateKey": "[^"]*"' "${REALITY_CONF}" | cut -d'"' -f4)"
-        cur_pubkey="$(xray x25519 -i "${privkey}" 2>/dev/null | awk '/Public key|Password/{print $NF}')"
+        cur_pubkey="$(grep reality "${URL_FILE}" 2>/dev/null | tail -1 | grep -o 'pbk=[^&]*' | cut -d= -f2)"
+        log_warn "公钥推导失败,链接沿用历史 pbk (可能与当前密钥不配对, 请重置密钥)。"
     fi
     local ip
     ip="$(curl -4 -s --max-time 8 https://api.ip.sb/ip || curl -4 -s --max-time 8 https://api.ipify.org)"
