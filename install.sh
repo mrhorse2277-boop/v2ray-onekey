@@ -163,6 +163,15 @@ record_port() {
     echo "$1" >> "${used_file}"
 }
 
+# 撤销端口记录 (安装/重置取消或失败时用, 避免未真正使用的端口长期占用
+# gen_port 的可用池)。只删一条与 $1 相同的记录。
+unrecord_port() {
+    local used_file="${V2RAY_CONF_DIR}/used_ports.txt"
+    [[ -f "${used_file}" ]] || return 0
+    local tmp="${used_file}.tmp.$$"
+    grep -vx "$1" "${used_file}" > "${tmp}" 2>/dev/null && mv -f "${tmp}" "${used_file}" || rm -f "${tmp}"
+}
+
 # 端口占用检查 (不含历史记录, 只看当前实际监听)
 port_in_use() {
     ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${1}\$"
@@ -1653,7 +1662,7 @@ do_install_reality() {
             fi
             log_error "  -> 目标站 ${REALITY_DEST} 部署前校验未通过 (状态已变化)。"
             # 非交互模式: 从 ok_dests 中剔除失败项, 自动换下一个
-            if [[ ! -t 0 && ${#ok_dests[@]} > 0 ]]; then
+            if [[ ! -t 0 ]] && (( ${#ok_dests[@]} > 0 )); then
                 local remain=() od
                 for od in "${ok_dests[@]}"; do
                     [[ "${od%%|*}" == "${REALITY_DEST}" ]] || remain+=("${od}")
@@ -2272,6 +2281,7 @@ do_reset_reality() {
         sed -i "s/\"port\": ${old_port},/\"port\": ${new_port},/" "${REALITY_CONF}"
         changed+=("端口 ${old_port} -> ${new_port}")
         record_port "${new_port}"
+        unrecord_port "${old_port}"
     fi
     if [[ "${reset_uuid}" == "1" ]]; then
         local old_uuid new_uuid
@@ -2331,6 +2341,10 @@ do_reset_reality() {
 # 重置 ws/h2/socks 节点要素: 选模式 -> 选要素 -> 改配置重启 -> 失败回滚 -> 重建分享链接
 do_reset_node() {
     check_root
+    # 必须局部化: b 分支会递归调用本函数, 全局残留会让上一轮的
+    # reset_port/reset_uuid/reset_creds 泄漏进新一轮选择 (如先选换端口
+    # 再 b 返回改选换 UUID, 结果端口也被重置)
+    local reset_port=0 reset_uuid=0 reset_creds=0
     while :; do
         echo "请选择要重置的节点模式:"
         echo "  1. ws+tls   (v2ray-ws)"
@@ -2403,6 +2417,7 @@ do_reset_node() {
             SOCKS_PORT="${new_port}"
             changed+=("端口 ${old_port} -> ${new_port}")
             record_port "${new_port}"
+            unrecord_port "${old_port}"
         fi
         if [[ "${reset_creds:-0}" == "1" ]]; then
             new_user="$(gen_random 8)"
@@ -2454,6 +2469,7 @@ do_reset_node() {
                     INTERNAL_PORT="${new_internal}"
                     WS_PORT="${new_ws_port}"
                     record_port "${new_internal}"
+                    unrecord_port "$(grep -o '"port": [0-9]*' "${conf}.bak" | head -1 | grep -o '[0-9]*')"
                     log_info "ws 模式: 对外监听端口 ${old_ws_port} -> ${new_ws_port} (nginx 配置将一并 reload)。"
                 fi
             else
@@ -2462,6 +2478,7 @@ do_reset_node() {
             fi
             changed+=("端口 ${old_port} -> ${new_port}")
             record_port "${new_port}"
+            unrecord_port "${old_port}"
         fi
         if [[ "${reset_uuid:-0}" == "1" ]]; then
             local old_uuid
