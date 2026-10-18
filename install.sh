@@ -163,6 +163,72 @@ record_port() {
     echo "$1" >> "${used_file}"
 }
 
+# 端口占用检查 (不含历史记录, 只看当前实际监听)
+port_in_use() {
+    ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${1}\$"
+}
+
+# 端口三选一: 默认 / 随机 / 自定义 (安装与重置共用)。
+# 用法: pick_port <用途说明> <默认端口> [已用记录文件]
+# 返回全局变量 PICK_PORT_RESULT。循环直到选中一个当前未被监听的端口:
+#   - 随机端口本身已做占用规避, 但仍复核一次 (防时间窗竞态);
+#   - 默认/自定义端口被占用或非法时提示并重新回到选择菜单;
+#   - 非交互 (stdin 非 tty, CLI 子命令/管道) 跳过询问, 等同于选随机。
+pick_port() {
+    local label="$1" default_port="$2" used_file="${3:-${V2RAY_CONF_DIR}/used_ports.txt}"
+    local p
+    if [[ ! -t 0 ]]; then
+        PICK_PORT_RESULT="$(gen_port "${used_file}")"
+        return 0
+    fi
+    while :; do
+        echo "请选择 ${label} 端口:"
+        echo "  1. 使用默认端口 ${default_port}"
+        echo "  2. 随机分配端口 (自动避开占用)"
+        echo "  3. 自定义端口 (1000-65535)"
+        read -rp "请选择 [1]: " p || p=""
+        p="${p:-1}"
+        case "${p}" in
+            1)
+                if port_in_use "${default_port}"; then
+                    log_error "默认端口 ${default_port} 已被占用,请换一个。"
+                    continue
+                fi
+                if [[ -f "${used_file}" ]] && grep -qw "${default_port}" "${used_file}"; then
+                    log_error "默认端口 ${default_port} 已被本脚本其他节点使用,请换一个。"
+                    continue
+                fi
+                PICK_PORT_RESULT="${default_port}"
+                return 0
+                ;;
+            2)
+                PICK_PORT_RESULT="$(gen_port "${used_file}")"
+                return 0
+                ;;
+            3)
+                read -rp "请输入端口号 (1000-65535): " p || p=""
+                if ! [[ "${p}" =~ ^[0-9]+$ ]] || (( p < 1000 || p > 65535 )); then
+                    log_error "端口号无效 (需 1000-65535),请重试。"
+                    continue
+                fi
+                if port_in_use "${p}"; then
+                    log_error "端口 ${p} 已被占用,请换一个。"
+                    continue
+                fi
+                if [[ -f "${used_file}" ]] && grep -qw "${p}" "${used_file}"; then
+                    log_error "端口 ${p} 已被本脚本其他节点使用,请换一个。"
+                    continue
+                fi
+                PICK_PORT_RESULT="${p}"
+                return 0
+                ;;
+            *)
+                log_error "无效输入,请重试。"
+                ;;
+        esac
+    done
+}
+
 # 端口监听终验: 分配时空闲不代表绑定成功 (存在时间窗竞态),
 # 服务启动后确认端口真的在监听, 最多等 5 秒
 verify_port_listening() {
@@ -952,7 +1018,8 @@ do_install_ws() {
     # nginx 将无法绑定 443 (静默失效), ws 改用独立 TLS 端口
     WS_PORT=443
     if ss -lnt 2>/dev/null | awk '{print $NF}' | grep -q "xray" || ss -lnp 2>/dev/null | grep ":443 " | grep -q "xray"; then
-        WS_PORT="$(gen_port "${V2RAY_CONF_DIR}/used_ports.txt")"
+        pick_port "ws+tls (443 已被 REALITY 占用, 需独立端口)" 8443
+        WS_PORT="${PICK_PORT_RESULT}"
         record_port "${WS_PORT}"
         log_warn "检测到 443 端口已被 xray (REALITY 模式) 占用,ws 将监听独立端口 ${WS_PORT}。"
         log_warn "请确保防火墙/安全组放行 ${WS_PORT}/tcp。"
@@ -1131,7 +1198,8 @@ do_install_h2() {
     issue_certificate
 
     UUID="$(gen_uuid)"
-    H2_PORT="$(gen_port "${V2RAY_CONF_DIR}/used_ports.txt")"
+    pick_port "h2+tls" 8443
+    H2_PORT="${PICK_PORT_RESULT}"
     record_port "${H2_PORT}"
     WS_PATH="$(gen_random 12)"
     CLIENT_REMARK="${DOMAIN}-${PROTOCOL}-h2"
@@ -1238,7 +1306,8 @@ EOF
 do_install_socks() {
     ensure_v2ray
 
-    SOCKS_PORT="$(gen_port "${V2RAY_CONF_DIR}/used_ports.txt")"
+    pick_port "socks5" 10808
+    SOCKS_PORT="${PICK_PORT_RESULT}"
     record_port "${SOCKS_PORT}"
     SOCKS_USER="$(gen_random 8)"
     SOCKS_PASS="$(gen_random 16)"
@@ -1450,7 +1519,8 @@ do_install_reality() {
         port443_busy=1
     fi
     if [[ "${port443_busy}" == "1" ]]; then
-        REALITY_PORT="$(gen_port "${V2RAY_CONF_DIR}/used_ports.txt")"
+        pick_port "REALITY (443 已被占用, 需独立端口)" 8443
+        REALITY_PORT="${PICK_PORT_RESULT}"
         log_info "443 端口已被占用 (如 ws 模式的 Nginx),REALITY 使用独立端口 ${REALITY_PORT}。"
     else
         REALITY_PORT=443
@@ -2171,7 +2241,8 @@ do_reset_reality() {
 
     if [[ "${reset_port}" == "1" ]]; then
         local new_port
-        new_port="$(gen_port "${V2RAY_CONF_DIR}/used_ports.txt")"
+        pick_port "REALITY 新端口" 8443
+        new_port="${PICK_PORT_RESULT}"
         sed -i "s/\"port\": ${old_port},/\"port\": ${new_port},/" "${REALITY_CONF}"
         changed+=("端口 ${old_port} -> ${new_port}")
         record_port "${new_port}"
@@ -2289,7 +2360,8 @@ do_reset_node() {
     if [[ "${is_socks}" == "1" ]]; then
         old_port="$(grep -o '"port": [0-9]*' "${conf}" | head -1 | grep -o '[0-9]*')"
         if [[ "${reset_port:-0}" == "1" ]]; then
-            new_port="$(gen_port "${V2RAY_CONF_DIR}/used_ports.txt")"
+            pick_port "socks5 新端口" 10808
+            new_port="${PICK_PORT_RESULT}"
             sed -i "s/\"port\": ${old_port},/\"port\": ${new_port},/" "${conf}"
             SOCKS_PORT="${new_port}"
             changed+=("端口 ${old_port} -> ${new_port}")
@@ -2305,7 +2377,8 @@ do_reset_node() {
     else
         old_port="$(grep -o '"port": [0-9]*' "${conf}" | head -1 | grep -o '[0-9]*')"
         if [[ "${reset_port:-0}" == "1" ]]; then
-            new_port="$(gen_port "${V2RAY_CONF_DIR}/used_ports.txt")"
+            pick_port "新端口 (ws 为客户端连接端口, h2 为服务端口)" 8443
+            new_port="${PICK_PORT_RESULT}"
             sed -i "s/\"port\": ${old_port},/\"port\": ${new_port},/" "${conf}"
             if [[ "${mode_pick}" == "1" ]]; then
                 # ws 模式: 客户端连接的是 nginx 监听端口, "更换端口"应作用于它;
