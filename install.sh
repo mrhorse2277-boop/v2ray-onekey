@@ -163,6 +163,15 @@ record_port() {
     echo "$1" >> "${used_file}"
 }
 
+# 服务以 nobody 运行, 配置需可读: root:nogroup 640 (不放 world)
+fix_config_perm() {
+    # sed -i 会重建文件导致属组回退为 root, 重置路径改完配置后调用本函数修正
+    local f="$1"
+    [[ -f "${f}" ]] || return 0
+    chmod 640 "${f}" 2>/dev/null
+    chgrp nogroup "${f}" 2>/dev/null || chgrp nobody "${f}" 2>/dev/null || true
+}
+
 # core 配置语法预检 (借鉴 wulabing/Xray_onekey 的安装收尾自检):
 # 配置写坏时 systemd + Restart=on-failure 会进入 crash loop, is-active 在
 # 短暂窗口内可能误报通过; 先用官方校验直接拒绝坏配置, 错误信息也更可读。
@@ -851,6 +860,10 @@ EOF
             --fullchain-file "${CRT_FILE}" \
             --key-file "${KEY_FILE}" \
             --reloadcmd "bash -c '${NGINX_BIN} -s reload 2>/dev/null; systemctl reload nginx 2>/dev/null; systemctl restart ${WS_SERVICE} ${H2_SERVICE} 2>/dev/null; exit 0'"
+        # 服务以 nobody 运行, 私钥需可读: root:nogroup 640 (nginx 以 root 起 worker
+        # 前读证书不受影响, key 只对 root 组内可见, 不放 world)
+        chmod 640 "${KEY_FILE}" 2>/dev/null
+        chgrp nogroup "${KEY_FILE}" 2>/dev/null || chgrp nobody "${KEY_FILE}" 2>/dev/null || true
         log_info "证书申请并安装成功: ${CRT_FILE}"
         [[ -n "${cert_backup}" ]] && rm -f "${cert_backup}"
     else
@@ -875,7 +888,7 @@ write_ssl_update_script() {
 /root/.acme.sh/acme.sh --renew -d "${DOMAIN}" --force \\
     --fullchain-file "${CRT_FILE}" \\
     --key-file "${KEY_FILE}" \\
-    --reloadcmd "bash -c '${NGINX_BIN} -s reload 2>/dev/null; systemctl reload nginx 2>/dev/null; systemctl restart ${WS_SERVICE} ${H2_SERVICE} 2>/dev/null; exit 0'"
+    --reloadcmd "bash -c 'chmod 640 ${KEY_FILE} 2>/dev/null; chgrp nogroup ${KEY_FILE} 2>/dev/null || chgrp nobody ${KEY_FILE} 2>/dev/null; ${NGINX_BIN} -s reload 2>/dev/null; systemctl reload nginx 2>/dev/null; systemctl restart ${WS_SERVICE} ${H2_SERVICE} 2>/dev/null; exit 0'"
 EOF
     chmod +x "${SSL_UPDATE_SH}"
 }
@@ -994,8 +1007,10 @@ EOF
 )
     fi
 
+    # 服务以 nobody 运行, 配置需可读: root:nogroup 640 (不放 world)
     echo "${config}" > "${WS_CONF}"
-    chmod 600 "${WS_CONF}"
+    chmod 640 "${WS_CONF}"
+    chgrp nogroup "${WS_CONF}" 2>/dev/null || chgrp nobody "${WS_CONF}" 2>/dev/null || true
 }
 
 write_ws_nginx_config() {
@@ -1084,6 +1099,8 @@ Description=V2Ray (ws+tls via nginx)
 After=network.target nss-lookup.target
 
 [Service]
+User=nobody
+Group=nogroup
 ExecStart=/usr/local/bin/v2ray run -config ${WS_CONF}
 Restart=on-failure
 RestartSec=5
@@ -1269,8 +1286,10 @@ write_h2_v2ray_config() {
 EOF
 )
 
+    # 服务以 nobody 运行, 配置需可读: root:nogroup 640 (不放 world)
     echo "${config}" > "${H2_CONF}"
-    chmod 600 "${H2_CONF}"
+    chmod 640 "${H2_CONF}"
+    chgrp nogroup "${H2_CONF}" 2>/dev/null || chgrp nobody "${H2_CONF}" 2>/dev/null || true
 }
 
 write_h2_service() {
@@ -1280,6 +1299,10 @@ Description=V2Ray (h2+tls direct)
 After=network.target nss-lookup.target
 
 [Service]
+User=nobody
+Group=nogroup
+# H2_PORT 可能为 443 (<1024 特权端口), 非 443 时该 capability 无害
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 ExecStart=/usr/local/bin/v2ray run -config ${H2_CONF}
 Restart=on-failure
 RestartSec=5
@@ -1403,8 +1426,10 @@ write_socks_config() {
 EOF
 )
 
+    # 服务以 nobody 运行, 配置需可读: root:nogroup 640 (不放 world)
     echo "${config}" > "${SOCKS_CONF}"
-    chmod 600 "${SOCKS_CONF}"
+    chmod 640 "${SOCKS_CONF}"
+    chgrp nogroup "${SOCKS_CONF}" 2>/dev/null || chgrp nobody "${SOCKS_CONF}" 2>/dev/null || true
 }
 
 write_socks_service() {
@@ -1414,6 +1439,8 @@ Description=V2Ray (socks5)
 After=network.target nss-lookup.target
 
 [Service]
+User=nobody
+Group=nogroup
 ExecStart=/usr/local/bin/v2ray run -config ${SOCKS_CONF}
 Restart=on-failure
 RestartSec=5
@@ -1930,8 +1957,10 @@ write_reality_config() {
 EOF
 )
 
+    # 服务以 nobody 运行, 配置需可读: root:nogroup 640 (不放 world)
     echo "${config}" > "${REALITY_CONF}"
-    chmod 600 "${REALITY_CONF}"
+    chmod 640 "${REALITY_CONF}"
+    chgrp nogroup "${REALITY_CONF}" 2>/dev/null || chgrp nobody "${REALITY_CONF}" 2>/dev/null || true
 }
 
 write_reality_service() {
@@ -1941,6 +1970,10 @@ Description=Xray (vless + reality)
 After=network.target nss-lookup.target
 
 [Service]
+User=nobody
+Group=nogroup
+# REALITY_PORT 可能为 443 (<1024 特权端口), 非任意端口时该 capability 无害
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 ExecStart=/usr/local/bin/xray run -config ${REALITY_CONF}
 Restart=on-failure
 RestartSec=5
@@ -2403,6 +2436,7 @@ do_reset_reality() {
         sed -i "s|\"privateKey\": \"[^\"]*\"|\"privateKey\": \"${X25519_PRIVKEY}\"|" "${REALITY_CONF}"
         changed+=("密钥对已更换 (新 pbk 见下方链接)")
     fi
+    fix_config_perm "${REALITY_CONF}"
 
     systemctl restart "${REALITY_SERVICE}"
     sleep 1
@@ -2594,6 +2628,7 @@ do_reset_node() {
         fi
     fi
 
+    fix_config_perm "${conf}"
     systemctl restart "${svc}"
     if [[ "${mode_pick}" == "1" ]]; then
         nginx_check_reload 2>/dev/null || true
@@ -2791,6 +2826,7 @@ do_change_reality_dest() {
     # 仅改 dest/sni, 保留 port/uuid/密钥/sid
     sed -i "s|\"dest\": \"${cur_dest}\"|\"dest\": \"${REALITY_DEST}\"|" "${REALITY_CONF}"
     sed -i "s|\"${cur_dest##*:}\"|\"${REALITY_SNI}\"|" "${REALITY_CONF}"
+    fix_config_perm "${REALITY_CONF}"
     systemctl restart "${REALITY_SERVICE}"
     sleep 1
     if ! systemctl is-active --quiet "${REALITY_SERVICE}"; then
