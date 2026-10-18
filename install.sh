@@ -163,6 +163,26 @@ record_port() {
     echo "$1" >> "${used_file}"
 }
 
+# core 配置语法预检 (借鉴 wulabing/Xray_onekey 的安装收尾自检):
+# 配置写坏时 systemd + Restart=on-failure 会进入 crash loop, is-active 在
+# 短暂窗口内可能误报通过; 先用官方校验直接拒绝坏配置, 错误信息也更可读。
+# 注意两个 core 的校验入口不同: v2ray 是独立子命令 `v2ray test`,
+# xray 是 `xray run -test` (实测确认, v2ray 无 run -test)。
+validate_core_config() {
+    local bin="$1" conf="$2" out
+    if [[ "$(basename "${bin}")" == "xray" ]]; then
+        out="$("$bin" run -test -config "${conf}" 2>&1)"
+    else
+        out="$("$bin" test -config "${conf}" 2>&1)"
+    fi
+    if [[ "$?" != "0" ]]; then
+        log_error "core 配置校验失败 (${conf}):"
+        echo "${out}" | head -10
+        return 1
+    fi
+    return 0
+}
+
 # 撤销端口记录 (安装/重置取消或失败时用, 避免未真正使用的端口长期占用
 # gen_port 的可用池)。只删一条与 $1 相同的记录。
 unrecord_port() {
@@ -1130,6 +1150,9 @@ do_install_ws() {
     open_firewall
 
     log_info "重启服务..."
+    if ! validate_core_config /usr/local/bin/v2ray "${WS_CONF}"; then
+        exit 1
+    fi
     systemctl restart "${WS_SERVICE}"
     nginx_check_reload
     sleep 1
@@ -1308,6 +1331,9 @@ do_install_h2() {
     open_firewall
 
     log_info "重启服务..."
+    if ! validate_core_config /usr/local/bin/v2ray "${H2_CONF}"; then
+        exit 1
+    fi
     systemctl restart "${H2_SERVICE}"
     sleep 1
 
@@ -1420,6 +1446,9 @@ do_install_socks() {
     open_firewall
 
     log_info "重启服务..."
+    if ! validate_core_config /usr/local/bin/v2ray "${SOCKS_CONF}"; then
+        exit 1
+    fi
     systemctl restart "${SOCKS_SERVICE}"
     sleep 1
 
@@ -1813,6 +1842,9 @@ do_install_reality() {
     open_firewall
 
     log_info "重启服务..."
+    if ! validate_core_config /usr/local/bin/xray "${REALITY_CONF}"; then
+        exit 1
+    fi
     systemctl restart "${REALITY_SERVICE}"
     sleep 1
 
