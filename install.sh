@@ -2753,9 +2753,14 @@ do_change_reality_dest() {
     # 从现有配置读取保留参数
     local cur_dest
     cur_dest="$(grep -o '"dest": "[^"]*"' "${REALITY_CONF}" | head -1 | cut -d'"' -f4)"
+    # 当前 SNI 取自 serverNames 数组 (dest 与 serverNames 可能因历史 bug 不一致, 以
+    # serverNames 为准 —— 它才是客户端握手的校验对象)
+    local cur_sni
+    cur_sni="$(grep -A1 '"serverNames"' "${REALITY_CONF}" | grep -o '"[^"]*"' | tr -d '"' | sed -n 2p)"
+    [[ -z "${cur_sni}" ]] && cur_sni="${cur_dest%%:*}"
     local cur_port
     cur_port="$(grep -o '"port": [0-9]*' "${REALITY_CONF}" | head -1 | grep -o '[0-9]*')"
-    log_info "当前伪装站: ${cur_dest} (端口 ${cur_port})"
+    log_info "当前伪装站: ${cur_dest} (端口 ${cur_port}, SNI ${cur_sni})"
 
     # 选择新站: 复用候选池探测 + GFW 过滤 + 延迟排序 + 交互选择/自定义 (与安装同一套逻辑)
     local sorted_pool=() entry
@@ -2823,16 +2828,20 @@ do_change_reality_dest() {
         fi
     done
 
-    # 仅改 dest/sni, 保留 port/uuid/密钥/sid
+    # 仅改 dest/sni, 保留 port/uuid/密钥/sid。
+    # serverNames 必须精确替换数组内元素: 泛化的 "s|旧sni|新sni|" 会先命中
+    # dest 行 (此时 dest 已改成新站) 造成漏改/错改 (实战踩坑: 换站后
+    # serverNames 残留旧站, 客户端 SNI 校验不过, 报
+    # "REALITY: received real certificate (potential MITM or redirection)")。
     sed -i "s|\"dest\": \"${cur_dest}\"|\"dest\": \"${REALITY_DEST}\"|" "${REALITY_CONF}"
-    sed -i "s|\"${cur_dest##*:}\"|\"${REALITY_SNI}\"|" "${REALITY_CONF}"
+    sed -i "/\"serverNames\"/,/]/ s|\"${cur_sni}\"|\"${REALITY_SNI}\"|" "${REALITY_CONF}"
     fix_config_perm "${REALITY_CONF}"
     systemctl restart "${REALITY_SERVICE}"
     sleep 1
     if ! systemctl is-active --quiet "${REALITY_SERVICE}"; then
         log_error "服务重启失败,回滚配置:"
         sed -i "s|\"dest\": \"${REALITY_DEST}\"|\"dest\": \"${cur_dest}\"|" "${REALITY_CONF}"
-        sed -i "s|\"${REALITY_SNI}\"|\"${cur_dest##*:}\"|" "${REALITY_CONF}"
+        sed -i "/\"serverNames\"/,/]/ s|\"${REALITY_SNI}\"|\"${cur_sni}\"|" "${REALITY_CONF}"
         systemctl restart "${REALITY_SERVICE}"
         journalctl -u "${REALITY_SERVICE}" --no-pager -n 10
         return 1
