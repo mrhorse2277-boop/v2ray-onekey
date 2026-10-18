@@ -6,6 +6,8 @@
 支持 **ws+tls / h2+tls / socks5 / vless+REALITY 四种模式同时安装、互不冲突**,分享链接适配最新版
 [v2rayN](https://github.com/2dust/v2rayN) / [v2rayNG](https://github.com/2dust/v2rayNG) 正式版。
 
+> 维护者请先读 [MAINTENANCE.md](MAINTENANCE.md)——架构要点、版本敏感点、每轮测试清单都在那里。
+
 ## 四种模式与共存方式
 
 | 模式 | 端口 | TLS/伪装 | 组件 | 抗封锁 |
@@ -59,10 +61,10 @@ Debian 10+ / Ubuntu 18.04+ / CentOS 7+/Rocky/AlmaLinux,推荐 Debian 11+ 或 Ubu
 ```bash
 # 一键下载并进入交互菜单 (将 mrhorse2277-boop/v2ray-onekey 替换为实际仓库路径)
 wget -N --no-check-certificate -q -O install.sh "https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh" && chmod +x install.sh && bash install.sh
-```
 
 # 非交互
-bash install.sh ws vmess     # vmess + ws + tls (Nginx, 443)bash install.sh ws vless     # vless + ws + tls
+bash install.sh ws vmess     # vmess + ws + tls (Nginx, 443)
+bash install.sh ws vless     # vless + ws + tls
 bash install.sh h2 vmess     # vmess + h2 + tls (独立端口)
 bash install.sh h2 vless     # vless + h2 + tls
 bash install.sh socks        # socks5 (随机用户名/密码, 独立端口)
@@ -82,9 +84,29 @@ bash install.sh reality && bash install.sh ws vless && bash install.sh socks
 ### REALITY 模式说明
 
 - 自动生成 x25519 密钥对与 shortId,无需任何人工输入
-- 内置多个伪装目标站(tesla/microsoft/samsung/nvidia 等),安装时逐一用 TLS 1.3 + H2 探测校验,不可用自动换下一个
+- 内置多个伪装目标站(按地区分组),安装时逐一用 TLS 1.3 + H2 探测校验并实测延迟,**自动剔除被 GFW 封锁的站点**(不在封锁列表的也经部署前终验兜底),最终选用延迟最低的可用站;菜单 10 可随时换站
 - 客户端流控为 `xtls-rprx-vision`,指纹模拟 chrome
 - 443 端口空闲时直接监听 443(伪装效果最佳);被占用时自动换独立端口
+
+### 端口选择
+
+所有需要端口的操作(安装 ws 独立端口/h2/socks5/REALITY、菜单 11/12 重置端口)都会询问:
+
+```
+  1. 使用默认端口 (ws/h2/REALITY 8443, socks5 10808)
+  2. 随机分配端口 (自动避开占用与本脚本其他节点)
+  3. 自定义端口 (1000-65535)
+  b. 返回上一级 (取消本次操作)
+```
+
+三种选择均做双重占用检查(`ss` 实际监听 + 本脚本端口记录),不通过则提示并返回重选;
+非交互模式(CLI 子命令)自动随机分配。v2ray 内部回环端口(proxy_pass)不询问,保持随机。
+
+### 菜单导航
+
+- 主菜单 `0` = 退出脚本
+- 所有子菜单 `0` = 返回主菜单;两层嵌套菜单(重置节点)第二层 `b` = 返回上一级
+- 端口选择、伪装站选择随时可输 `b` 取消本次操作(取消后配置原样不动)
 
 ### 客户端导入
 
@@ -109,7 +131,25 @@ bash install.sh reality && bash install.sh ws vless && bash install.sh socks
 | 7 | 查看全部已安装节点 / 导出全部分享链接 |
 | 8 | 手动续签 / 重新申请证书(ws/h2 共用) |
 | 9 | 更新 V2Ray / Xray core(全部服务一并重启) |
-| 10 | 卸载(单模式或全部) |
+| 10 | 更换 REALITY 伪装站(保留 UUID/端口,客户端只改 SNI) |
+| 11 | 重置 REALITY 节点(端口 / UUID / 密钥 / 全部) |
+| 12 | 重置 ws/h2/socks 节点(端口 / UUID / 用户密码) |
+| 13 | 卸载(单模式或全部) |
+| 0 | 退出 |
+
+重置端口/安装端口支持"默认/随机/自定义"三选一(见上文端口选择)。
+
+## 先装代理后装宝塔
+
+若先用本脚本装了 ws(配置在发行版 nginx),之后才安装宝塔,宝塔 Nginx 不加载
+`/etc/nginx/conf.d`,ws 会失效。脚本检测到该情况会自动把配置迁移到宝塔 vhost 目录,
+迁移后验证(宝塔 nginx reload 成功 + ws 服务与端口正常),验证不通过自动回退并告知原因。
+
+## 验证过的系统
+
+Debian 11/12/13、Ubuntu 18.04/20.04/22.04/24.04 真机完整测试
+(systemd 237–257、nginx 新旧两种模板格式);CentOS/Rocky/Alma 为代码级支持,
+未做真机验证。
 
 ## 文件位置
 
