@@ -163,6 +163,20 @@ record_port() {
     echo "$1" >> "${used_file}"
 }
 
+# 端口监听终验: 分配时空闲不代表绑定成功 (存在时间窗竞态),
+# 服务启动后确认端口真的在监听, 最多等 5 秒
+verify_port_listening() {
+    local port="$1" tries
+    for tries in 1 2 3 4 5; do
+        if ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"; then
+            return 0
+        fi
+        sleep 1
+    done
+    log_error "端口 ${port} 未处于监听状态 (可能已被其他程序占用,或服务启动失败)。"
+    return 1
+}
+
 pause() { read -rp "按回车键继续..." _; }
 
 # ---------- 环境检查 ----------
@@ -925,6 +939,15 @@ do_install_ws() {
         journalctl -u nginx --no-pager -n 20
         exit 1
     fi
+    # 端口监听终验: v2ray 内部端口 + nginx 对外端口都必须真的在监听
+    if ! verify_port_listening "${INTERNAL_PORT}"; then
+        journalctl -u "${WS_SERVICE}" --no-pager -n 20
+        exit 1
+    fi
+    if ! verify_port_listening "${WS_PORT}"; then
+        log_error "nginx 未监听对外端口 ${WS_PORT} (配置可能被其他站点抢占)。"
+        exit 1
+    fi
 
     show_mode_info
     if [[ "${NGINX_ENV}" == "btpanel" ]]; then
@@ -1084,6 +1107,10 @@ do_install_h2() {
         journalctl -u "${H2_SERVICE}" --no-pager -n 20
         exit 1
     fi
+    if ! verify_port_listening "${H2_PORT}"; then
+        journalctl -u "${H2_SERVICE}" --no-pager -n 20
+        exit 1
+    fi
 
     show_mode_info
     log_confirm "h2+tls 安装完成 (端口: ${H2_PORT},请在防火墙/安全组放行)。"
@@ -1185,6 +1212,10 @@ do_install_socks() {
 
     if ! systemctl is-active --quiet "${SOCKS_SERVICE}"; then
         log_error "${SOCKS_SERVICE} 服务未正常运行:"
+        journalctl -u "${SOCKS_SERVICE}" --no-pager -n 20
+        exit 1
+    fi
+    if ! verify_port_listening "${SOCKS_PORT}"; then
         journalctl -u "${SOCKS_SERVICE}" --no-pager -n 20
         exit 1
     fi
@@ -1566,6 +1597,10 @@ do_install_reality() {
 
     if ! systemctl is-active --quiet "${REALITY_SERVICE}"; then
         log_error "${REALITY_SERVICE} 服务未正常运行:"
+        journalctl -u "${REALITY_SERVICE}" --no-pager -n 20
+        exit 1
+    fi
+    if ! verify_port_listening "${REALITY_PORT}"; then
         journalctl -u "${REALITY_SERVICE}" --no-pager -n 20
         exit 1
     fi
@@ -2214,16 +2249,26 @@ do_reset_node() {
                 local old_ws_port new_ws_port
                 old_ws_port="$(grep -m1 -oE "listen [0-9]+ ssl" "${WS_NGINX_CONF}" | grep -o "[0-9]*")"
                 old_ws_port="${old_ws_port:-443}"
+                # proxy_pass 可能与 conf 漂移 (历史版本 bug 或手工改动):
+                # 以 nginx 实际指向为准改写, sed 匹配不到时兜底, 避免静默失配
+                local cur_proxy_port
+                cur_proxy_port="$(grep -m1 -oE 'proxy_pass http://127\.0\.0\.1:[0-9]+' "${WS_NGINX_CONF}" | grep -o '[0-9]*$')"
                 if [[ "${old_ws_port}" == "443" ]]; then
                     INTERNAL_PORT="${new_port}"
-                    sed -i "s|proxy_pass http://127.0.0.1:${old_port};|proxy_pass http://127.0.0.1:${new_port};|" "${WS_NGINX_CONF}"
+                    sed -i "s|proxy_pass http://127.0.0.1:${cur_proxy_port};|proxy_pass http://127.0.0.1:${new_port};|" "${WS_NGINX_CONF}"
+                    if ! grep -q "proxy_pass http://127.0.0.1:${new_port};" "${WS_NGINX_CONF}"; then
+                        sed -i "s|proxy_pass http://127.0.0.1:[0-9]*;|proxy_pass http://127.0.0.1:${new_port};|" "${WS_NGINX_CONF}"
+                    fi
                     log_info "ws 模式: 对外端口仍为 443 (nginx 并入), v2ray 内部端口已更新为 ${new_port}。"
                 else
                     new_ws_port="${new_port}"
                     local new_internal
                     new_internal="$(gen_port "${V2RAY_CONF_DIR}/used_ports.txt")"
                     sed -i "s/\"port\": ${new_port},/\"port\": ${new_internal},/" "${conf}"
-                    sed -i "s|proxy_pass http://127.0.0.1:${old_port};|proxy_pass http://127.0.0.1:${new_internal};|" "${WS_NGINX_CONF}"
+                    sed -i "s|proxy_pass http://127.0.0.1:${cur_proxy_port};|proxy_pass http://127.0.0.1:${new_internal};|" "${WS_NGINX_CONF}"
+                    if ! grep -q "proxy_pass http://127.0.0.1:${new_internal};" "${WS_NGINX_CONF}"; then
+                        sed -i "s|proxy_pass http://127.0.0.1:[0-9]*;|proxy_pass http://127.0.0.1:${new_internal};|" "${WS_NGINX_CONF}"
+                    fi
                     sed -i "s|listen ${old_ws_port} ssl|listen ${new_ws_port} ssl|; s|listen \[::\]:${old_ws_port} ssl|listen [::]:${new_ws_port} ssl|" "${WS_NGINX_CONF}"
                     INTERNAL_PORT="${new_internal}"
                     WS_PORT="${new_ws_port}"
@@ -2256,17 +2301,31 @@ do_reset_node() {
         log_error "服务重启失败,回滚配置:"
         mv "${conf}.bak" "${conf}"
         if [[ "${mode_pick}" == "1" && "${reset_port:-0}" == "1" ]]; then
-            sed -i "s|proxy_pass http://127.0.0.1:${new_port};|proxy_pass http://127.0.0.1:${old_port};|" "${WS_NGINX_CONF}"
+            sed -i "s|proxy_pass http://127.0.0.1:[0-9]*;|proxy_pass http://127.0.0.1:${old_port};|" "${WS_NGINX_CONF}"
         fi
         systemctl restart "${svc}"
         journalctl -u "${svc}" --no-pager -n 10
         return 1
     fi
-    rm -f "${conf}.bak"
 
+    # 端口监听终验: 重启成功但端口没监听 (被抢/绑定失败) 同样按失败回滚
+    # 注意: 备份文件在终验通过后才删除, 保证此分支可回滚
     if [[ "${reset_port:-0}" == "1" ]]; then
+        local final_port
+        final_port="$(grep -o '"port": [0-9]*' "${conf}" | head -1 | grep -o '[0-9]*')"
+        if ! verify_port_listening "${final_port}"; then
+            log_error "新端口 ${final_port} 未监听,回滚配置:"
+            mv "${conf}.bak" "${conf}"
+            if [[ "${mode_pick}" == "1" ]]; then
+                sed -i "s|proxy_pass http://127.0.0.1:[0-9]*;|proxy_pass http://127.0.0.1:${old_port};|" "${WS_NGINX_CONF}"
+            fi
+            systemctl restart "${svc}"
+            journalctl -u "${svc}" --no-pager -n 10
+            return 1
+        fi
         open_firewall
     fi
+    rm -f "${conf}.bak"
 
     # 重建分享链接: 从当前配置读取参数复用 build_share_link 的变量约定
     if [[ "${is_socks}" == "1" ]]; then
