@@ -544,6 +544,11 @@ ensure_xray() {
         log_error "Xray 安装失败,请检查网络。"
         exit 1
     fi
+    # 官方 Xray-install 脚本会自启并开机启用自带的 xray.service (跑占位 config.json),
+    # 本脚本所有 REALITY 实例使用独立的 xray-reality.service, 该官方服务是无用常驻进程,
+    # 且与我们的实例无关, 统一停用禁用 (跨发行版 systemctl 行为一致)。
+    systemctl stop xray 2>/dev/null || true
+    systemctl disable xray >/dev/null 2>&1 || true
     mkdir -p "${XRAY_CONF_DIR}"
 }
 
@@ -2025,13 +2030,13 @@ do_uninstall() {
             stop_service_sync "${SOCKS_SERVICE}" v2ray
             systemctl disable "${SOCKS_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${SOCKS_SERVICE}.service" "${SOCKS_CONF}"
-            sed -i '/### socks5/,/^$/d' "${INFO_FILE}" 2>/dev/null
+            sed -i '/### socks$/,/^$/d' "${INFO_FILE}" 2>/dev/null
             ;;
         4)
             stop_service_sync "${REALITY_SERVICE}" xray
             systemctl disable "${REALITY_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${REALITY_SERVICE}.service" "${REALITY_CONF}"
-            sed -i '/### reality/,/^$/d' "${INFO_FILE}" 2>/dev/null
+            sed -i '/### vless+reality$/,/^$/d' "${INFO_FILE}" 2>/dev/null
             ;;
         5)
             stop_service_sync "${WS_SERVICE}" v2ray
@@ -2061,7 +2066,9 @@ do_uninstall() {
             rm -f /usr/local/bin/xray
             rm -rf /usr/local/share/xray /usr/local/etc/xray
             # 官方卸载后的残余: 模板配置与空目录清理
-            rm -f "${XRAY_CONF_DIR}/config.json"
+            # (fhs-install-v2ray 会生成模板 config.json "{}", 不删则 rmdir 必然失败)
+            rm -f "${V2RAY_CONF_DIR}/config.json" "${XRAY_CONF_DIR}/config.json"
+            rm -rf "${V2RAY_CONF_DIR}" "${XRAY_CONF_DIR}"
             rmdir "${V2RAY_CONF_DIR}" "${XRAY_CONF_DIR}" 2>/dev/null || true
             # 平滑重载 Nginx (宝塔或发行版), 绝不 stop 现有网站服务
             if [[ "${NGINX_ENV}" == "btpanel" && -x "${NGINX_BIN}" ]]; then
