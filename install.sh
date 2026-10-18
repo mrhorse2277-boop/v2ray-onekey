@@ -443,6 +443,34 @@ install_dependencies() {
 
 # 探测系统现有 Nginx 环境 (宝塔面板 / 发行版 Nginx / 全新系统)
 # 结果写入 NGINX_ENV / NGINX_BIN / NGINX_VHOST_DIR / NGINX_RELOAD_CMD / WS_NGINX_CONF
+# 场景: 先用本脚本装过 ws (配置在发行版 nginx), 之后装了宝塔 —— 旧配置位于
+# /etc/nginx/conf.d, 宝塔 nginx 不加载该目录, ws 节点会静默失效; 检测到此
+# 情况时自动把配置迁移到宝塔 vhost 目录并重载两边 (任一 nginx 可用即恢复)。
+migrate_ws_conf_to_btpanel() {
+    local old_conf="/etc/nginx/conf.d/v2ray-ws-tls.conf"
+    [[ -f "${old_conf}" ]] || return 0
+    [[ ! -f "${WS_NGINX_CONF}" ]] || return 0   # 宝塔目录已有, 不重复迁移
+    if [[ -t 0 ]]; then
+        log_warn "检测到旧的 ws nginx 配置 (/etc/nginx/conf.d) 与宝塔环境并存,"
+        log_warn "宝塔 Nginx 不会加载该目录, ws 节点已失效。"
+        local yn
+        read -rp "是否迁移到宝塔 Nginx (${WS_NGINX_CONF})? [Y/n]: " yn
+        [[ "${yn,,}" == "n" ]] && { log_info "已跳过迁移 (旧配置保持原样)。"; return 0; }
+    else
+        log_info "检测到旧的 ws nginx 配置与宝塔环境并存,自动迁移到宝塔 Nginx。"
+    fi
+    mv -f "${old_conf}" "${WS_NGINX_CONF}"
+    if [[ -x /www/server/nginx/sbin/nginx ]]; then
+        /www/server/nginx/sbin/nginx -t >/dev/null 2>&1 && /www/server/nginx/sbin/nginx -s reload \
+            && log_info "已迁移并在宝塔 Nginx 上生效。"
+    fi
+    # 发行版 nginx 仍在运行则一并重载, 让它释放旧配置 (文件已移走, reload 无副作用)
+    if command -v nginx >/dev/null 2>&1 && systemctl is-active --quiet nginx 2>/dev/null; then
+        nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+    fi
+    log_info "迁移完成。"
+}
+
 detect_nginx_env() {
     # 1) 宝塔面板: 使用宝塔自编译 Nginx, 配置写进其 vhost 目录
     if [[ -d "${BT_PANEL_DIR}" && -d "${BT_NGINX_VHOST_DIR}" && -x /www/server/nginx/sbin/nginx ]]; then
@@ -452,6 +480,7 @@ detect_nginx_env() {
         WS_NGINX_CONF="${NGINX_VHOST_DIR}/v2ray-ws-tls.conf"
         NGINX_RELOAD_CMD="${NGINX_BIN} -s reload"
         log_info "检测到宝塔面板,将复用宝塔 Nginx (不安装第二个 Nginx): ${NGINX_BIN}"
+        migrate_ws_conf_to_btpanel
         return
     fi
 
