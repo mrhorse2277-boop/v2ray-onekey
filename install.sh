@@ -179,6 +179,37 @@ verify_port_listening() {
 
 pause() { read -rp "按回车键继续..." _; }
 
+# 停止服务并同步等待进程退出 (卸载用)。
+# 不同 systemd 版本 stop 完成时间差异大 (255 会异步收尾): 若发完信号就删 unit 文件,
+# stop 可能被跳过, 服务进程沦为孤儿继续监听端口。此函数等待进程真正退出, 兜底 SIGKILL。
+# 进程匹配限定本脚本配置路径 (run -config /usr/local/etc/{v2ray,xray}/config_*.json),
+# 不误伤系统里其他 v2ray/xray 实例。
+# 可移植性注意: 不用分组括号 (procps-ng 老版本 pgrep 对 (a|b) 分组行为不一致), 用两条简单正则。
+stop_service_sync() {
+    local svc="$1" i alive p
+    local pats=(
+        'run -config /usr/local/etc/v2ray/config_'
+        'run -config /usr/local/etc/xray/config_'
+    )
+    systemctl stop "${svc}" 2>/dev/null || true
+    for i in 1 2 3 4 5; do
+        alive=0
+        for p in "${pats[@]}"; do
+            if pgrep -f "${p}" >/dev/null 2>&1; then
+                alive=1
+                break
+            fi
+        done
+        [[ "${alive}" == "0" ]] && return 0
+        sleep 1
+    done
+    # 循环走完说明仍有进程存活, 精确匹配后强杀
+    for p in "${pats[@]}"; do
+        pkill -KILL -f "${p}" 2>/dev/null || true
+    done
+    return 0
+}
+
 # ---------- 环境检查 ----------
 
 check_root() {
@@ -1972,7 +2003,8 @@ do_uninstall() {
 
     case "${choice}" in
         1)
-            systemctl disable --now "${WS_SERVICE}" >/dev/null 2>&1
+            stop_service_sync "${WS_SERVICE}" v2ray
+            systemctl disable "${WS_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${WS_SERVICE}.service" "${WS_CONF}"
             # 兼容宝塔与发行版: 两个可能位置都尝试清理 (文件不存在则无操作)
             rm -f "${WS_NGINX_CONF}" "/etc/nginx/conf.d/v2ray-ws-tls.conf" "${BT_NGINX_VHOST_DIR}/v2ray-ws-tls.conf"
@@ -1984,22 +2016,29 @@ do_uninstall() {
             sed -i '/### vmess+ws/,/^$/d;/### vless+ws/,/^$/d' "${INFO_FILE}" 2>/dev/null
             ;;
         2)
-            systemctl disable --now "${H2_SERVICE}" >/dev/null 2>&1
+            stop_service_sync "${H2_SERVICE}" v2ray
+            systemctl disable "${H2_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${H2_SERVICE}.service" "${H2_CONF}"
             sed -i '/### vmess+h2/,/^$/d;/### vless+h2/,/^$/d' "${INFO_FILE}" 2>/dev/null
             ;;
         3)
-            systemctl disable --now "${SOCKS_SERVICE}" >/dev/null 2>&1
+            stop_service_sync "${SOCKS_SERVICE}" v2ray
+            systemctl disable "${SOCKS_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${SOCKS_SERVICE}.service" "${SOCKS_CONF}"
             sed -i '/### socks5/,/^$/d' "${INFO_FILE}" 2>/dev/null
             ;;
         4)
-            systemctl disable --now "${REALITY_SERVICE}" >/dev/null 2>&1
+            stop_service_sync "${REALITY_SERVICE}" xray
+            systemctl disable "${REALITY_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${REALITY_SERVICE}.service" "${REALITY_CONF}"
             sed -i '/### reality/,/^$/d' "${INFO_FILE}" 2>/dev/null
             ;;
         5)
-            systemctl disable --now "${WS_SERVICE}" "${H2_SERVICE}" "${SOCKS_SERVICE}" "${REALITY_SERVICE}" >/dev/null 2>&1
+            stop_service_sync "${WS_SERVICE}" v2ray
+            stop_service_sync "${H2_SERVICE}" v2ray
+            stop_service_sync "${SOCKS_SERVICE}" v2ray
+            stop_service_sync "${REALITY_SERVICE}" xray
+            systemctl disable "${WS_SERVICE}" "${H2_SERVICE}" "${SOCKS_SERVICE}" "${REALITY_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${WS_SERVICE}.service" "/etc/systemd/system/${H2_SERVICE}.service" \
                   "/etc/systemd/system/${SOCKS_SERVICE}.service" "/etc/systemd/system/${REALITY_SERVICE}.service"
             rm -f "${WS_NGINX_CONF}" "/etc/nginx/conf.d/v2ray-ws-tls.conf" "${BT_NGINX_VHOST_DIR}/v2ray-ws-tls.conf" \
@@ -2015,7 +2054,8 @@ do_uninstall() {
                 bash /usr/local/bin/xray-uninstall || true
             fi
             # Xray 官方安装脚本无 --remove 选项, 手动清理其安装内容
-            systemctl disable --now xray 2>/dev/null || true
+            systemctl stop xray 2>/dev/null || true
+            systemctl disable xray 2>/dev/null || true
             rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service
             rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d
             rm -f /usr/local/bin/xray
