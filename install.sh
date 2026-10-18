@@ -219,12 +219,19 @@ preflight_check() {
         warns+=("systemd 未运行 (容器环境?),服务安装后可能无法自启,需手动管理")
     fi
 
-    # 2. 核心工具: 缺失即无法继续 (iproute2 提供 ss, coreutils 提供 timeout/shuf/od)
+    # 2. 核心工具: 缺失不立即退出 (最小化镜像常见), 交由 install_dependencies 安装后再复核;
+    #    仅在系统无任何可用包管理器时才阻断
     local t missing_core=""
     for t in curl ss timeout shuf awk sed grep openssl; do
-        command -v "${t%% *}" >/dev/null 2>&1 || missing_core+="${t} "
+        command -v "${t}" >/dev/null 2>&1 || missing_core+="${t} "
     done
-    [[ -n "${missing_core}" ]] && errors+=("缺少核心工具: ${missing_core}(将尝试通过包管理器安装,失败请手动装)")
+    if [[ -n "${missing_core}" ]]; then
+        if command -v apt-get >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+            warns+=("缺少核心工具: ${missing_core}(将由包管理器自动安装)")
+        else
+            errors+=("缺少核心工具: ${missing_core},且系统无 apt-get/dnf/yum,无法自动安装")
+        fi
+    fi
 
     # 3. 架构: v2ray/xray 官方发布支持的范围
     local arch
@@ -275,7 +282,7 @@ install_dependencies() {
     if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -y
-        apt-get install -y curl wget socat qrencode openssl cron ca-certificates
+        apt-get install -y curl wget socat qrencode openssl cron ca-certificates iproute2 coreutils findutils
         systemctl enable --now cron >/dev/null 2>&1 || systemctl enable --now crond >/dev/null 2>&1
     elif command -v dnf >/dev/null 2>&1; then
         # Rocky/Alma/Fedora: qrencode 在 EPEL (部分镜像已内置)
@@ -295,8 +302,9 @@ install_dependencies() {
     fi
 
     # 缺失项降级处理: 核心依赖必须存在, 次要依赖缺失仅告警
+    # (与预检清单一致: ss/iproute、timeout/shuf/od/coreutils 为端口与服务逻辑必需)
     local missing_core=""
-    for c in curl wget openssl; do
+    for c in curl wget openssl ss timeout shuf awk sed grep; do
         command -v "${c}" >/dev/null 2>&1 || missing_core+="${c} "
     done
     if [[ -n "${missing_core}" ]]; then
@@ -1308,8 +1316,12 @@ check_gfw_list() {
 
 # 获取 VPS 所在地区 (基于时区, 无外部依赖; 失败返回空)
 detect_vps_region() {
+    # 三级兜底: timedatectl show (systemd 220+) / /etc/timezone (Debian 系) /
+    # /etc/localtime 符号链接 (RHEL 系 CentOS 7 无前两者)
     local tz
-    tz="$(timedatectl show -p Timezone --value 2>/dev/null)" || tz="$(cat /etc/timezone 2>/dev/null)" || tz=""
+    tz="$(timedatectl show -p Timezone --value 2>/dev/null)" || tz=""
+    [[ -z "${tz}" ]] && tz="$(cat /etc/timezone 2>/dev/null)" || true
+    [[ -z "${tz}" ]] && tz="$(readlink /etc/localtime 2>/dev/null | sed 's|^.*zoneinfo/||')" || true
     case "${tz}" in
         Asia/Hong_Kong|Asia/Macau)              echo "香港" ;;
         Asia/Taipei)                            echo "台湾" ;;
