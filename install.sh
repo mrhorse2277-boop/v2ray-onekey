@@ -2737,6 +2737,10 @@ do_update_v2ray() {
     bash <(curl -L -s "${V2RAY_INSTALL_SCRIPT}")
     log_info "更新 Xray core..."
     bash <(curl -L -s "${XRAY_INSTALL_SCRIPT}")
+    # 官方安装脚本重跑会重新启用自带的 xray.service (跑占位 config.json),
+    # 与 ensure_xray 同样处理: 停用禁用, 只保留本脚本的 xray-reality.service
+    systemctl stop xray 2>/dev/null || true
+    systemctl disable xray >/dev/null 2>&1 || true
     systemctl restart "${WS_SERVICE}" "${H2_SERVICE}" "${SOCKS_SERVICE}" "${REALITY_SERVICE}" 2>/dev/null
     log_info "V2Ray / Xray 已更新,相关服务已重启。"
 }
