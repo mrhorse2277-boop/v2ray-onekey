@@ -38,6 +38,10 @@ PLAIN='\033[0m'
 V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
+# --- 脚本自更新 (菜单 14) ---
+SCRIPT_VERSION="1.1.0"
+SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
+
 CERT_DIR="/data"
 CRT_FILE="${CERT_DIR}/v2ray.crt"
 KEY_FILE="${CERT_DIR}/v2ray.key"
@@ -3098,6 +3102,7 @@ show_menu() {
     echo -e "11. 重置 REALITY 节点 (端口 / UUID / 密钥 / 全部)"
     echo -e "12. 重置 ws/h2/socks 节点 (端口 / UUID / 用户密码)"
     echo -e "13. 卸载 (可选单模式或全部)"
+    echo -e "14. 更新脚本 (从 GitHub 下载最新版覆盖本脚本)"
     echo -e " 0. 退出"
     echo
     read -rp "请选择: " choice || exit 0
@@ -3115,6 +3120,7 @@ show_menu() {
         11) do_reset_reality ;;
         12) do_reset_node ;;
         13) do_uninstall ;;
+        14) do_self_update ;;
         0) exit 0 ;;
         *) ;;
     esac
@@ -3126,6 +3132,56 @@ do_renew_cert() {
         return
     fi
     bash "${SSL_UPDATE_SH}"
+}
+
+# 从 GitHub 下载最新脚本覆盖本地: 校验通过才替换, 失败保留原脚本
+do_self_update() {
+    check_root
+    local self_path
+    self_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    if [[ ! -f "${self_path}" ]] || [[ "${self_path}" == *"downloaded from stdin"* ]]; then
+        log_error "无法定位当前脚本文件,请用 bash <路径>/install.sh 方式运行后再更新。"
+        return 1
+    fi
+    log_info "当前脚本版本: v${SCRIPT_VERSION}"
+    log_info "正在从 GitHub 下载最新脚本..."
+    local tmp="${self_path}.new.$$"
+    if ! curl -fsSL --max-time 60 "${SELF_UPDATE_URL}" -o "${tmp}"; then
+        log_error "下载失败 (网络不通或代理未配置),原脚本未改动。"
+        rm -f "${tmp}"
+        return 1
+    fi
+    # 校验 1: 是本脚本的合法副本 (含版本行), 防止把错误页/404 文本覆盖进去
+    if ! grep -q '^SCRIPT_VERSION=' "${tmp}" || ! grep -q 'v2ray-ws-tls-onekey' "${tmp}"; then
+        log_error "下载内容校验失败 (不是合法脚本),原脚本未改动。"
+        rm -f "${tmp}"
+        return 1
+    fi
+    # 校验 2: 语法正确
+    if ! bash -n "${tmp}"; then
+        log_error "下载脚本语法校验失败,原脚本未改动。"
+        rm -f "${tmp}"
+        return 1
+    fi
+    local new_ver
+    new_ver="$(grep -m1 '^SCRIPT_VERSION=' "${tmp}" | cut -d'"' -f2)"
+    if [[ "${new_ver}" == "${SCRIPT_VERSION}" ]]; then
+        log_info "已是最新版本 (v${SCRIPT_VERSION}),无需更新。"
+        rm -f "${tmp}"
+        return 0
+    fi
+    # 校验通过: 备份 -> 原子替换 -> 失败回滚
+    cp -a "${self_path}" "${self_path}.bak.$$" || { rm -f "${tmp}"; return 1; }
+    if mv -f "${tmp}" "${self_path}" && chmod +x "${self_path}"; then
+        rm -f "${self_path}.bak.$$"
+        log_info "更新完成: v${SCRIPT_VERSION} -> v${new_ver}。重新运行 bash ${self_path} 生效。"
+        exit 0
+    else
+        log_error "替换失败,已回滚到原脚本。"
+        mv -f "${self_path}.bak.$$" "${self_path}" 2>/dev/null
+        rm -f "${tmp}"
+        return 1
+    fi
 }
 
 main() {
