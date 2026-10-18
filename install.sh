@@ -170,9 +170,11 @@ port_in_use() {
 
 # 端口三选一: 默认 / 随机 / 自定义 (安装与重置共用)。
 # 用法: pick_port <用途说明> <默认端口> [已用记录文件]
-# 返回全局变量 PICK_PORT_RESULT。循环直到选中一个当前未被监听的端口:
+# 返回全局变量 PICK_PORT_RESULT; 返回值 1 = 用户选择 b 返回上一级 (调用方应中止当前操作)。
+# 循环直到选中一个当前未被监听的端口:
 #   - 随机端口本身已做占用规避, 但仍复核一次 (防时间窗竞态);
 #   - 默认/自定义端口被占用或非法时提示并重新回到选择菜单;
+#   - b 返回上级, 0/回车退出整个流程;
 #   - 非交互 (stdin 非 tty, CLI 子命令/管道) 跳过询问, 等同于选随机。
 pick_port() {
     local label="$1" default_port="$2" used_file="${3:-${V2RAY_CONF_DIR}/used_ports.txt}"
@@ -186,7 +188,8 @@ pick_port() {
         echo "  1. 使用默认端口 ${default_port}"
         echo "  2. 随机分配端口 (自动避开占用)"
         echo "  3. 自定义端口 (1000-65535)"
-        read -rp "请选择 [1]: " p || p=""
+        echo "  b. 返回上一级 (取消本次操作)"
+        read -rp "请选择 [1]: " p || return 1
         p="${p:-1}"
         case "${p}" in
             1)
@@ -206,7 +209,11 @@ pick_port() {
                 return 0
                 ;;
             3)
-                read -rp "请输入端口号 (1000-65535): " p || p=""
+                read -rp "请输入端口号 (1000-65535, b 返回): " p || return 1
+                p="${p,,}"
+                if [[ "${p}" == "b" ]]; then
+                    return 1
+                fi
                 if ! [[ "${p}" =~ ^[0-9]+$ ]] || (( p < 1000 || p > 65535 )); then
                     log_error "端口号无效 (需 1000-65535),请重试。"
                     continue
@@ -221,6 +228,9 @@ pick_port() {
                 fi
                 PICK_PORT_RESULT="${p}"
                 return 0
+                ;;
+            b|B)
+                return 1
                 ;;
             *)
                 log_error "无效输入,请重试。"
@@ -1018,7 +1028,10 @@ do_install_ws() {
     # nginx 将无法绑定 443 (静默失效), ws 改用独立 TLS 端口
     WS_PORT=443
     if ss -lnt 2>/dev/null | awk '{print $NF}' | grep -q "xray" || ss -lnp 2>/dev/null | grep ":443 " | grep -q "xray"; then
-        pick_port "ws+tls (443 已被 REALITY 占用, 需独立端口)" 8443
+        if ! pick_port "ws+tls (443 已被 REALITY 占用, 需独立端口)" 8443; then
+            log_info "已取消 ws 安装。"
+            return 1
+        fi
         WS_PORT="${PICK_PORT_RESULT}"
         record_port "${WS_PORT}"
         log_warn "检测到 443 端口已被 xray (REALITY 模式) 占用,ws 将监听独立端口 ${WS_PORT}。"
@@ -1198,7 +1211,10 @@ do_install_h2() {
     issue_certificate
 
     UUID="$(gen_uuid)"
-    pick_port "h2+tls" 8443
+    if ! pick_port "h2+tls" 8443; then
+        log_info "已取消 h2 安装。"
+        return 1
+    fi
     H2_PORT="${PICK_PORT_RESULT}"
     record_port "${H2_PORT}"
     WS_PATH="$(gen_random 12)"
@@ -1306,7 +1322,10 @@ EOF
 do_install_socks() {
     ensure_v2ray
 
-    pick_port "socks5" 10808
+    if ! pick_port "socks5" 10808; then
+        log_info "已取消 socks5 安装。"
+        return 1
+    fi
     SOCKS_PORT="${PICK_PORT_RESULT}"
     record_port "${SOCKS_PORT}"
     SOCKS_USER="$(gen_random 8)"
@@ -1456,7 +1475,7 @@ select_reality_dest_interactive() {
         echo "  $((i+1)). ${_ok[$i]%%|*}  (${_ok[$i]##*|}ms)"
     done
     echo "  c. 自定义其他域名 (自动校验 TLS1.3/H2, 达标才接受)"
-    echo "  q. 放弃 (更换场景下原配置不动)"
+    echo "  q. 返回上一级 / 放弃 (更换场景下原配置不动)"
     echo
     echo "提示: 优先选与 VPS 同地区、你平时常访问的大站, 伪装更自然。"
     while :; do
@@ -1519,7 +1538,10 @@ do_install_reality() {
         port443_busy=1
     fi
     if [[ "${port443_busy}" == "1" ]]; then
-        pick_port "REALITY (443 已被占用, 需独立端口)" 8443
+        if ! pick_port "REALITY (443 已被占用, 需独立端口)" 8443; then
+            log_info "已取消 REALITY 安装。"
+            return 1
+        fi
         REALITY_PORT="${PICK_PORT_RESULT}"
         log_info "443 端口已被占用 (如 ws 模式的 Nginx),REALITY 使用独立端口 ${REALITY_PORT}。"
     else
@@ -2073,7 +2095,7 @@ do_uninstall() {
     echo "  3. socks5 (v2ray-socks)"
     echo "  4. vless+REALITY (xray-reality)"
     echo "  5. 全部卸载"
-    echo "  0. 取消"
+    echo "  0. 返回主菜单"
     read -rp "请选择: " choice
 
     case "${choice}" in
@@ -2220,7 +2242,7 @@ do_reset_reality() {
     echo "  2. 仅更换 UUID    (旧客户端立即失效)"
     echo "  3. 仅更换密钥对   (pbk 变化, 节点身份重置)"
     echo "  4. 全部重置       (端口+UUID+密钥)"
-    echo "  0. 取消"
+    echo "  0. 返回主菜单"
     read -rp "请选择: " choice || return
 
     local reset_port=0 reset_uuid=0 reset_key=0
@@ -2241,7 +2263,11 @@ do_reset_reality() {
 
     if [[ "${reset_port}" == "1" ]]; then
         local new_port
-        pick_port "REALITY 新端口" 8443
+        if ! pick_port "REALITY 新端口" 8443; then
+            log_info "已取消重置 (原配置未动)。"
+            rm -f "${REALITY_CONF}.bak"
+            return 1
+        fi
         new_port="${PICK_PORT_RESULT}"
         sed -i "s/\"port\": ${old_port},/\"port\": ${new_port},/" "${REALITY_CONF}"
         changed+=("端口 ${old_port} -> ${new_port}")
@@ -2305,25 +2331,28 @@ do_reset_reality() {
 # 重置 ws/h2/socks 节点要素: 选模式 -> 选要素 -> 改配置重启 -> 失败回滚 -> 重建分享链接
 do_reset_node() {
     check_root
-    echo "请选择要重置的节点模式:"
-    echo "  1. ws+tls   (v2ray-ws)"
-    echo "  2. h2+tls   (v2ray-h2)"
-    echo "  3. socks5   (v2ray-socks)"
-    echo "  0. 取消"
-    read -rp "请选择: " mode_pick || return
+    while :; do
+        echo "请选择要重置的节点模式:"
+        echo "  1. ws+tls   (v2ray-ws)"
+        echo "  2. h2+tls   (v2ray-h2)"
+        echo "  3. socks5   (v2ray-socks)"
+        echo "  0. 返回主菜单"
+        read -rp "请选择: " mode_pick || return
 
-    local conf svc svc_label port_var old_port new_port new_uuid new_user new_pass
-    local is_socks=0
-    case "${mode_pick}" in
-        1) conf="${WS_CONF}";   svc="${WS_SERVICE}";   svc_label="ws+tls" ;;
-        2) conf="${H2_CONF}";   svc="${H2_SERVICE}";   svc_label="h2+tls" ;;
-        3) conf="${SOCKS_CONF}"; svc="${SOCKS_SERVICE}"; svc_label="socks5"; is_socks=1 ;;
-        *) return ;;
-    esac
-    if [[ ! -f "${conf}" || ! -f "/etc/systemd/system/${svc}.service" ]]; then
-        log_error "未安装 ${svc_label} 模式,请先安装。"
-        return
-    fi
+        local conf svc svc_label port_var old_port new_port new_uuid new_user new_pass
+        local is_socks=0
+        case "${mode_pick}" in
+            1) conf="${WS_CONF}";   svc="${WS_SERVICE}";   svc_label="ws+tls" ;;
+            2) conf="${H2_CONF}";   svc="${H2_SERVICE}";   svc_label="h2+tls" ;;
+            3) conf="${SOCKS_CONF}"; svc="${SOCKS_SERVICE}"; svc_label="socks5"; is_socks=1 ;;
+            0|*) return ;;
+        esac
+        if [[ ! -f "${conf}" || ! -f "/etc/systemd/system/${svc}.service" ]]; then
+            log_error "未安装 ${svc_label} 模式,请先安装。"
+            return
+        fi
+        break
+    done
 
     echo
     if [[ "${is_socks}" == "1" ]]; then
@@ -2331,26 +2360,30 @@ do_reset_node() {
         echo "  1. 仅更换端口"
         echo "  2. 仅更换用户名/密码"
         echo "  3. 端口 + 用户名/密码 全部重置"
-        echo "  0. 取消"
+        echo "  b. 返回上一级 (重新选模式)"
+        echo "  0. 返回主菜单"
         read -rp "请选择: " elem_pick || return
         case "${elem_pick}" in
             1) reset_port=1 ;;
             2) reset_creds=1 ;;
             3) reset_port=1; reset_creds=1 ;;
-            *) return ;;
+            b|B) do_reset_node; return ;;
+            0|*) return ;;
         esac
     else
         echo "请选择要重置的项目:"
         echo "  1. 仅更换端口"
         echo "  2. 仅更换 UUID"
         echo "  3. 端口 + UUID 全部重置"
-        echo "  0. 取消"
+        echo "  b. 返回上一级 (重新选模式)"
+        echo "  0. 返回主菜单"
         read -rp "请选择: " elem_pick || return
         case "${elem_pick}" in
             1) reset_port=1 ;;
             2) reset_uuid=1 ;;
             3) reset_port=1; reset_uuid=1 ;;
-            *) return ;;
+            b|B) do_reset_node; return ;;
+            0|*) return ;;
         esac
     fi
 
@@ -2360,7 +2393,11 @@ do_reset_node() {
     if [[ "${is_socks}" == "1" ]]; then
         old_port="$(grep -o '"port": [0-9]*' "${conf}" | head -1 | grep -o '[0-9]*')"
         if [[ "${reset_port:-0}" == "1" ]]; then
-            pick_port "socks5 新端口" 10808
+            if ! pick_port "socks5 新端口" 10808; then
+                log_info "已取消重置 (原配置未动)。"
+                rm -f "${conf}.bak"
+                return 1
+            fi
             new_port="${PICK_PORT_RESULT}"
             sed -i "s/\"port\": ${old_port},/\"port\": ${new_port},/" "${conf}"
             SOCKS_PORT="${new_port}"
@@ -2377,7 +2414,11 @@ do_reset_node() {
     else
         old_port="$(grep -o '"port": [0-9]*' "${conf}" | head -1 | grep -o '[0-9]*')"
         if [[ "${reset_port:-0}" == "1" ]]; then
-            pick_port "新端口 (ws 为客户端连接端口, h2 为服务端口)" 8443
+            if ! pick_port "新端口 (ws 为客户端连接端口, h2 为服务端口)" 8443; then
+                log_info "已取消重置 (原配置未动)。"
+                rm -f "${conf}.bak"
+                return 1
+            fi
             new_port="${PICK_PORT_RESULT}"
             sed -i "s/\"port\": ${old_port},/\"port\": ${new_port},/" "${conf}"
             if [[ "${mode_pick}" == "1" ]]; then
