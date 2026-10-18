@@ -445,7 +445,9 @@ install_dependencies() {
 # 结果写入 NGINX_ENV / NGINX_BIN / NGINX_VHOST_DIR / NGINX_RELOAD_CMD / WS_NGINX_CONF
 # 场景: 先用本脚本装过 ws (配置在发行版 nginx), 之后装了宝塔 —— 旧配置位于
 # /etc/nginx/conf.d, 宝塔 nginx 不加载该目录, ws 节点会静默失效; 检测到此
-# 情况时自动把配置迁移到宝塔 vhost 目录并重载两边 (任一 nginx 可用即恢复)。
+# 情况时自动把配置迁移到宝塔 vhost 目录并重载两边。
+# 迁移后做双重验证 (宝塔 nginx 配置可用 + v2ray-ws 服务与端口正常),
+# 任一不通过则整体回退: 配置移回原位、重载两边, 并告知用户手动处理。
 migrate_ws_conf_to_btpanel() {
     local old_conf="/etc/nginx/conf.d/v2ray-ws-tls.conf"
     [[ -f "${old_conf}" ]] || return 0
@@ -459,16 +461,57 @@ migrate_ws_conf_to_btpanel() {
     else
         log_info "检测到旧的 ws nginx 配置与宝塔环境并存,自动迁移到宝塔 Nginx。"
     fi
+
+    local bt_nginx="/www/server/nginx/sbin/nginx"
+    local reload_bt_ok=0 reload_old_ok=0
+
     mv -f "${old_conf}" "${WS_NGINX_CONF}"
-    if [[ -x /www/server/nginx/sbin/nginx ]]; then
-        /www/server/nginx/sbin/nginx -t >/dev/null 2>&1 && /www/server/nginx/sbin/nginx -s reload \
-            && log_info "已迁移并在宝塔 Nginx 上生效。"
+    if [[ -x "${bt_nginx}" ]]; then
+        if "${bt_nginx}" -t >/dev/null 2>&1 && "${bt_nginx}" -s reload >/dev/null 2>&1; then
+            reload_bt_ok=1
+        fi
     fi
     # 发行版 nginx 仍在运行则一并重载, 让它释放旧配置 (文件已移走, reload 无副作用)
     if command -v nginx >/dev/null 2>&1 && systemctl is-active --quiet nginx 2>/dev/null; then
+        nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null && reload_old_ok=1
+    fi
+
+    # ---- 迁移后验证 ----
+    # 1) 宝塔 nginx: 配置测试通过且 reload 成功 (reload 失败意味着新配置有问题,
+    #    nginx 会继续跑旧配置, ws 依旧不通)
+    # 2) ws 服务: v2ray-ws unit 存在时要求服务 active 且内部端口监听
+    #    (v2ray-ws 是独立 systemd 服务, 不随 nginx 重启, 正常应不受迁移影响;
+    #     迁移若引发异常说明环境有其他问题, 同样按失败回退)
+    local bt_ok=0 ws_ok=0
+    [[ "${reload_bt_ok}" == "1" ]] && bt_ok=1
+    if [[ -f "/etc/systemd/system/${WS_SERVICE}.service" ]]; then
+        if systemctl is-active --quiet "${WS_SERVICE}" \
+            && verify_port_listening "$(grep -o '"port": [0-9]*' "${WS_CONF}" | head -1 | grep -o '[0-9]*')" >/dev/null 2>&1; then
+            ws_ok=1
+        fi
+    else
+        ws_ok=1   # ws 未安装, 无需验证服务
+    fi
+
+    if [[ "${bt_ok}" == "1" && "${ws_ok}" == "1" ]]; then
+        log_info "迁移验证通过: 宝塔 Nginx 配置生效,ws 服务与端口正常。迁移完成。"
+        return 0
+    fi
+
+    # ---- 回退 ----
+    log_warn "迁移后验证未通过 (宝塔 nginx reload: ${reload_bt_ok}/1, ws 服务: ${ws_ok}/1),回退迁移:"
+    mv -f "${WS_NGINX_CONF}" "${old_conf}"
+    if [[ -x "${bt_nginx}" ]]; then
+        "${bt_nginx}" -t >/dev/null 2>&1 && "${bt_nginx}" -s reload >/dev/null 2>&1 || true
+    fi
+    if command -v nginx >/dev/null 2>&1 && systemctl is-active --quiet nginx 2>/dev/null; then
         nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
     fi
-    log_info "迁移完成。"
+    log_warn "已回退: ws 配置保持原位 (${old_conf}),宝塔环境未改动。"
+    log_warn "宝塔 Nginx 无法加载该配置目录,ws 节点仍不可用。建议: 先在宝塔中"
+    log_warn "停止或卸载其 Nginx 后重跑本脚本, 或手动把 ${old_conf} 的内容"
+    log_warn "并入宝塔站点配置后再迁移。"
+    return 1
 }
 
 detect_nginx_env() {
