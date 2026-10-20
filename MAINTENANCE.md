@@ -4,10 +4,10 @@
 
 ## 仓库与部署
 
-- 唯一交付物是 `install.sh`(约 2900 行,单文件 self-contained,无外部依赖文件)
+- 唯一交付物是 `install.sh`(约 3200 行,单文件 self-contained,无外部依赖文件)
 - GitHub 仓库:`mrhorse2277-boop/v2ray-onekey`(main 分支)
-- 本地直连 github.com 不稳时,推送走本机代理:
-  `git -c http.proxy=http://127.0.0.1:10809 push`
+- 本机推送走本机代理(10809 已停,用 socks5h://127.0.0.1:10808;DNS 也走代理避免解析污染):
+  `git -c http.proxy=socks5h://127.0.0.1:10808 -c credential.helper= -c credential.helper="manager" push`
 - 用户侧一键命令从 `raw.githubusercontent.com` 拉取,推送即发布,**没有版本分支/tag 隔离**——
   所以"测试通过再 push"是硬约束
 
@@ -65,6 +65,20 @@
 - **取消路径**:pick_port 返回 1 = 用户 b 取消;安装场景 return 1 中止,
   重置场景删 .bak 后 return 1。注意 `do_reset_node` 的 b 分支是**递归调用**,
   局部状态必须 local(f84a6e8 修过标志泄漏)
+- **链接来源铁律**:菜单 7 与菜单 10/11/12 的新链接一律**从实际配置文件现场生成**
+  (REALITY 的 pbk 由私钥 `xray x25519 -i` 推导优先,URL_FILE 历史值只作兜底),
+  不信任 INFO_FILE/URL_FILE 里的 share_url(历史记录可能陈旧,b8e5b6b 重写过菜单 7);
+  导出文件每次重建不追加
+- **freedom 出站 UseIPv4**:五个配置模板的 freedom outbound 都带
+  `settings.domainStrategy=UseIPv4`(60f59ca,用户 VPS IPv6 回程不稳),
+  改配置模板时别丢;手工给存量机器补这个参数用 sed 定位
+  `"protocol": "freedom"` 插入 settings 块
+- **脚本自更新(菜单 14)**:`SCRIPT_VERSION` 是版本对比的唯一依据,
+  **每次改完脚本必须手动递增**(不一致才触发覆盖,相同则提示已是最新);
+  自更新带合法性(grep 标识)+语法(bash -n)双校验和备份回滚
+- **降权与权限**:服务以 nobody 运行,配置文件必须 `root:nogroup 640`
+  (`fix_config_perm`);任何 sed -i 改配置的路径之后都要补一次属组修正,
+  否则服务读不到配置起不来
 
 ## 常用调试命令
 

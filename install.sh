@@ -25,6 +25,7 @@
 #   bash install.sh reality      非交互安装 vless+REALITY
 #   bash install.sh info         查看全部已安装节点
 #   bash install.sh uninstall    交互卸载
+#   交互菜单 14 = 更新脚本自身 (从 GitHub 下载最新版覆盖本地脚本)
 #
 
 export LC_ALL=C
@@ -2299,7 +2300,7 @@ do_show_info() {
                     j=$(cat <<EOF
 {
   "v": "2",
-  "ps": "${m_domain}-vmess-ws",
+  "ps": "${m_domain}-${proto}-ws",
   "add": "${m_domain}",
   "port": "${m_port}",
   "id": "${m_uuid}",
@@ -2319,17 +2320,16 @@ EOF
                     b64=$(printf '%s' "${j}" | openssl base64 -A | tr -d '=' | tr '+/' '-_')
                     m_url="vmess://${b64}"
                 else
-                    m_url="vless://${m_uuid}@${m_domain}:${m_port}?type=ws&security=tls&host=${m_domain}&path=${enc_path}&sni=${m_domain}&fp=chrome&encryption=none#${m_domain}-ws"
+                    m_url="vless://${m_uuid}@${m_domain}:${m_port}?type=ws&security=tls&host=${m_domain}&path=${enc_path}&sni=${m_domain}&fp=chrome&encryption=none#${m_domain}-${proto}-ws"
                 fi
             else
-                m_url="vless://${m_uuid}@${m_domain}:${m_port}?type=h2&security=tls&host=${m_domain}&path=${enc_path}&sni=${m_domain}&fp=chrome&encryption=none#${m_domain}-h2"
                 proto="$(grep -o '"protocol": "[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
                 if [[ "${proto}" == "vmess" ]]; then
                     local j2 b642
                     j2=$(cat <<EOF
 {
   "v": "2",
-  "ps": "${m_domain}-vmess-h2",
+  "ps": "${m_domain}-${proto}-h2",
   "add": "${m_domain}",
   "port": "${m_port}",
   "id": "${m_uuid}",
@@ -2349,7 +2349,7 @@ EOF
                     b642=$(printf '%s' "${j2}" | openssl base64 -A | tr -d '=' | tr '+/' '-_')
                     m_url="vmess://${b642}"
                 else
-                    m_url="vless://${m_uuid}@${m_domain}:${m_port}?type=h2&security=tls&host=${m_domain}&path=${enc_path}&sni=${m_domain}&fp=chrome&encryption=none#${m_domain}-h2"
+                    m_url="vless://${m_uuid}@${m_domain}:${m_port}?type=h2&security=tls&host=${m_domain}&path=${enc_path}&sni=${m_domain}&fp=chrome&encryption=none#${m_domain}-${proto}-h2"
                 fi
             fi
             out_lines+=(" 分享链接: ${m_url}")
