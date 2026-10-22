@@ -40,7 +40,7 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 
 CERT_DIR="/data"
@@ -3139,18 +3139,37 @@ MIGRATIONS=(
 )
 
 # --- 迁移: 1.3.0 freedom 出站 UseIPv4 ---
-# 配置由本脚本生成, JSON 结构固定: "protocol": "freedom" 后跟 "settings": {...}。
-# 已带 domainStrategy 的配置 (1.3.0 起安装) 检测后跳过, 幂等。
+# 配置由本脚本生成, 但存量机器可能被手工改过, freedom 行有两种常见形态:
+#   "protocol": "freedom",   (1.3.0+ 模板, 尾逗号)
+#   "protocol": "freedom"    (手工 sed 删行后的变体, 无尾逗号)
+# 两种都要兼容; 已带 domainStrategy 的配置检测后跳过, 幂等。
 migr_useipv4() {
     local conf="$1" bin="$2"
     [[ -f "${conf}" ]] || return 0   # 该模式未安装, 跳过
     if grep -q '"domainStrategy"' "${conf}"; then
         return 0   # 已有字段, 幂等跳过
     fi
-    # 在 freedom outbound 的 "protocol": "freedom", 行后插入 settings 块
-    # (本脚本生成的配置 freedom 恒带尾逗号, 该行结构唯一可定位)
-    if ! sed -i '/"protocol": "freedom",/a\      "settings": {\n        "domainStrategy": "UseIPv4"\n      },' "${conf}" \
-        || ! grep -q '"domainStrategy": "UseIPv4"' "${conf}"; then
+    local hit=0
+    if grep -q '"protocol": *"freedom",' "${conf}"; then
+        # 形态 1: freedom 带尾逗号 (后面还有别的 outbound), 在该行后插 settings 块
+        sed -i '/"protocol": *"freedom",/a\      "settings": {\n        "domainStrategy": "UseIPv4"\n      },' "${conf}" && hit=1
+    elif grep -q '"protocol": *"freedom"' "${conf}"; then
+        # 形态 2: freedom 无尾逗号 (手工删改后的存量), 原行补逗号 + settings 块
+        # (settings 块不带尾逗号, 无论 freedom 后面是 "}" 还是 "}," 都合法)
+        awk '{
+            if ($0 ~ /"protocol": *"freedom"$/ && $0 !~ /,$/) {
+                sub(/$/, ",")
+                print
+                print "      \"settings\": {"
+                print "        \"domainStrategy\": \"UseIPv4\""
+                print "      }"
+            } else print
+        }' "${conf}" > "${conf}.migr.$$" && mv -f "${conf}.migr.$$" "${conf}" && hit=1
+    fi
+    if [[ "${hit}" != "1" ]] || ! grep -q '"domainStrategy": "UseIPv4"' "${conf}"; then
+        # 失败时打印实际结构供诊断, 而不是无声失败
+        log_error "  无法在 ${conf} 定位 freedom outbound, 实际结构:"
+        grep -n -A3 '"protocol"' "${conf}" | head -20
         return 1
     fi
     validate_core_config "${bin}" "${conf}" || return 1
