@@ -40,7 +40,7 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.4.3"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 
 CERT_DIR="/data"
@@ -1385,6 +1385,7 @@ do_install_h2() {
     fi
 
     show_mode_info
+    show_h2_client_notice
     log_confirm "h2+tls 安装完成 (端口: ${H2_PORT},请在防火墙/安全组放行)。"
 }
 
@@ -2124,6 +2125,16 @@ show_qr() {
     echo "${url}" | qrencode -t ANSIUTF8
 }
 
+# h2 模式的客户端支持提示: 新版 v2rayN (7.10+ / 26.x 内核架构) 已从传输白名单
+# 移除 h2/http, 链接导入会被当作 raw 导致连接失败; v2rayNG 全版本可用。
+# 凡输出 h2 节点链接的入口 (安装完成 / 菜单 7 / 菜单 12 重置) 都调用本函数。
+show_h2_client_notice() {
+    log_warn "h2 模式客户端支持提示:"
+    log_warn "  - v2rayNG: 全版本支持,可正常导入使用"
+    log_warn "  - v2rayN: 仅 6.x 及更早旧版可用; 7.10+/26.x 新版已移除 h2 传输,"
+    log_warn "    导入会显示 raw 且无法连接。新版 v2rayN 用户请改用 ws 或 REALITY 模式"
+}
+
 append_info() {
     local section="$1"
     # 同名段落已存在 (同模式重装) 时先删除旧段落, 避免菜单 7 出现重复/过期条目
@@ -2342,10 +2353,12 @@ do_show_info() {
         return
     fi
 
-    local ol
+    local ol has_h2=0
     for ol in "${exported[@]}"; do
         out_lines+=(" 分享链接: ${ol}")
+        [[ "${ol}" == *"type=http&"* || "${ol}" == *"\"net\": \"http\""* ]] && has_h2=1
     done
+    [[ "${has_h2}" == "1" ]] && show_h2_client_notice
 
     clear
     echo -e "${GREEN}================ 已安装节点 (实时读取配置) ================${PLAIN}"
@@ -2846,6 +2859,7 @@ do_reset_node() {
     done
     echo -e " 新链接   : ${SHARE_URL}"
     [[ -n "${SHARE_URL_PLAIN:-}" ]] && echo -e " 工具格式 : ${SHARE_URL_PLAIN}"
+    [[ "${svc_label}" == "h2+tls" ]] && show_h2_client_notice
     echo -e "${GREEN}==========================================${PLAIN}"
     show_qr "${SHARE_URL}"
     log_confirm "客户端请删除旧节点并导入上面的新链接 (旧链接已失效)。"

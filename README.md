@@ -152,6 +152,10 @@ bash install.sh reality && bash install.sh ws vless && bash install.sh socks
 所有模式的代理出站固定走 **IPv4**(freedom 出站 `domainStrategy: UseIPv4`),
 避免 VPS 的 IPv6 回程质量不稳导致部分站点访问异常。
 
+> **h2 模式的客户端支持**:v2rayNG 全版本可用;**新版 v2rayN(7.10+/26.x 内核架构)
+> 已从传输白名单移除 h2/http,h2 节点链接无法正确导入(会被当作 raw 导致连接失败)**。
+> h2 节点请用 v2rayNG 导入,或改用 ws / REALITY 模式。脚本安装与查看节点时均会提示。
+
 ## 已装机器升级
 
 已安装过旧版脚本的机器:先菜单 14 把脚本本体更新到最新,再跑一次**菜单 15**——
