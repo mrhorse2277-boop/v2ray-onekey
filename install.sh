@@ -40,7 +40,7 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.4.4"
+SCRIPT_VERSION="1.4.5"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 
 CERT_DIR="/data"
@@ -2023,9 +2023,15 @@ rebuild_url_file() {
 # 从磁盘上的实际配置现场生成全部当前有效链接并重建导出文件 (do_show_info 的生成逻辑,
 # 不依赖内存变量/历史记录)。菜单 10/11/12 改完配置后调用, 文件里不残留失效的旧链接。
 rebuild_url_file_from_config() {
-    local tmp_exported=()
+    local tmp_exported=() ex
     collect_current_urls tmp_exported
-    rebuild_url_file "${tmp_exported[@]}"
+    # 工具格式行是菜单 7 专用展示, 不入导出文件
+    local filtered=()
+    for ex in "${tmp_exported[@]}"; do
+        [[ "${ex}" == 工具格式* ]] && continue
+        filtered+=("${ex}")
+    done
+    rebuild_url_file "${filtered[@]}"
 }
 
 url_encode() {
@@ -2269,6 +2275,10 @@ collect_current_urls() {
         s_pass="$(grep -o '"pass": "[^"]*"' "${SOCKS_CONF}" | cut -d'"' -f4)"
         s_b64=$(printf '%s' "${s_user}:${s_pass}" | openssl base64 -A | tr -d '=')
         _urls_ref+=("socks://${s_b64}@${ip}:${p}#socks5-${ip}")
+        # 菜单 7 展示用工具格式 (与安装时 SHARE_URL_PLAIN/PLAIN2 一致):
+        # 前缀 "工具格式:" 供 do_show_info 识别展示, rebuild 时会剔除带该前缀的行
+        _urls_ref+=("工具格式:${ip}:${p}:${s_user}:${s_pass}{socks5-${ip}}(刷新URL)")
+        _urls_ref+=("工具格式2:socks5://${s_user}:${s_pass}@${ip}:${p}#socks5-${ip}")
     fi
 
     # --- ws / h2: 域名从 nginx server_name 或证书 SAN 推导, 端口/uuid/path 从各自配置 ---
@@ -2358,6 +2368,11 @@ do_show_info() {
 
     local ol has_h2=0
     for ol in "${exported[@]}"; do
+        if [[ "${ol}" == 工具格式* ]]; then
+            # socks 工具格式行 (菜单 7 专用展示, 不入导出文件)
+            out_lines+=(" ${ol}")
+            continue
+        fi
         out_lines+=(" 分享链接: ${ol}")
         [[ "${ol}" == *"type=http&"* || "${ol}" == *"\"net\": \"http\""* ]] && has_h2=1
     done
@@ -2369,8 +2384,9 @@ do_show_info() {
         echo -e "${ol}"
     done
     echo -e "${GREEN}=============================================${PLAIN}"
-    # 导出文件每次重建 (而非追加): 只含当前真实配置对应的链接, 旧链接不入文件
-    rebuild_url_file "${exported[@]}"
+    # 导出文件每次重建 (而非追加): 只含当前真实配置对应的链接, 旧链接不入文件;
+    # 工具格式行是展示辅助, 过滤掉不入文件
+    rebuild_url_file $(printf '%s\n' "${exported[@]}" | grep -v '^工具格式' || true)
     log_confirm "全部分享链接已导出到: ${URL_FILE} (每次运行重建, 保证与当前配置一致)"
 }
 
