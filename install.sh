@@ -40,7 +40,7 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.4.3"
+SCRIPT_VERSION="1.4.4"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 
 CERT_DIR="/data"
@@ -2049,8 +2049,10 @@ build_share_link() {
         get_public_ip
         host="${PUBLIC_IP:-127.0.0.1}"
         SHARE_URL="socks://${b64cred}@${host}:${SOCKS_PORT}#$(url_encode "${CLIENT_REMARK}")"
-        # 附加格式: IP:端口:用户:密码{备注} (部分代理工具的导入格式)
-        SHARE_URL_PLAIN="${host}:${SOCKS_PORT}:${SOCKS_USER}:${SOCKS_PASS}{${CLIENT_REMARK}}"
+        # 附加格式 1: IP:端口:用户:密码{备注} (部分代理工具的导入格式)
+        SHARE_URL_PLAIN="${host}:${SOCKS_PORT}:${SOCKS_USER}:${SOCKS_PASS}{${CLIENT_REMARK}}(刷新URL)"
+        # 附加格式 2: 带协议前缀 (部分工具要求 socks5:// 开头才识别)
+        SHARE_URL_PLAIN2="socks5://${SOCKS_USER}:${SOCKS_PASS}@${host}:${SOCKS_PORT}#${CLIENT_REMARK}"
         return
     fi
 
@@ -2220,6 +2222,7 @@ show_mode_info() {
     fi
     echo -e " 分享链接    : ${SHARE_URL}"
     [[ -n "${SHARE_URL_PLAIN:-}" ]] && echo -e " 工具格式    : ${SHARE_URL_PLAIN}"
+    [[ -n "${SHARE_URL_PLAIN2:-}" ]] && echo -e " 工具格式2   : ${SHARE_URL_PLAIN2}"
     echo -e "${GREEN}==========================================${PLAIN}"
 
     append_info "$([[ "${PROTOCOL}" ]] && echo "${PROTOCOL}+${MODE}" || echo "${MODE}")"
@@ -2859,6 +2862,7 @@ do_reset_node() {
     done
     echo -e " 新链接   : ${SHARE_URL}"
     [[ -n "${SHARE_URL_PLAIN:-}" ]] && echo -e " 工具格式 : ${SHARE_URL_PLAIN}"
+    [[ -n "${SHARE_URL_PLAIN2:-}" ]] && echo -e " 工具格式2: ${SHARE_URL_PLAIN2}"
     [[ "${svc_label}" == "h2+tls" ]] && show_h2_client_notice
     echo -e "${GREEN}==========================================${PLAIN}"
     show_qr "${SHARE_URL}"
