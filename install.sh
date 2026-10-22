@@ -40,7 +40,7 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 
 CERT_DIR="/data"
@@ -2008,6 +2008,25 @@ EOF
 
 # ---------- 分享链接 (兼容最新版 v2rayN / v2rayNG) ----------
 
+# 重建导出文件: 把传入的链接集合整体写入 URL_FILE (非追加),
+# 供菜单 7 与菜单 10/11/12 变更完成后共用, 保证文件里永远只有最新链接
+rebuild_url_file() {
+    {
+        local u
+        for u in "$@"; do
+            echo "${u}"
+        done
+    } > "${URL_FILE}"
+}
+
+# 从磁盘上的实际配置现场生成全部当前有效链接并重建导出文件 (do_show_info 的生成逻辑,
+# 不依赖内存变量/历史记录)。菜单 10/11/12 改完配置后调用, 文件里不残留失效的旧链接。
+rebuild_url_file_from_config() {
+    local tmp_exported=()
+    collect_current_urls tmp_exported
+    rebuild_url_file "${tmp_exported[@]}"
+}
+
 url_encode() {
     local s="$1" out="" c
     for (( i=0; i<${#s}; i++ )); do
@@ -2025,7 +2044,7 @@ build_share_link() {
         # socks 新格式 (v2rayN/v2rayNG 均支持): socks://base64(user:pass)@host:port#备注
         local cred b64cred host
         cred="${SOCKS_USER}:${SOCKS_PASS}"
-        b64cred=$(printf '%s' "${cred}" | openssl base64 -A | tr -d '=' | tr '+/' '-_')
+        b64cred=$(printf '%s' "${cred}" | openssl base64 -A | tr -d '=')
         get_public_ip
         host="${PUBLIC_IP:-127.0.0.1}"
         SHARE_URL="socks://${b64cred}@${host}:${SOCKS_PORT}#$(url_encode "${CLIENT_REMARK}")"
@@ -2053,7 +2072,8 @@ build_share_link() {
         # vless 标准 URI: encryption=none; h2 的 type 为 h2, path URL 编码
         local enc_path
         enc_path="$(url_encode "/${WS_PATH}")"
-        SHARE_URL="vless://${UUID}@${DOMAIN}:${port}?type=${net}&security=tls&host=${DOMAIN}&path=${enc_path}&sni=${DOMAIN}&fp=chrome&encryption=none#$(url_encode "${CLIENT_REMARK}")"
+        # h2 补 alpn=h2: 服务端 inbound 声明了 ["h2"], 客户端侧同步锁定握手协议
+        SHARE_URL="vless://${UUID}@${DOMAIN}:${port}?type=${net}&security=tls&host=${DOMAIN}&path=${enc_path}&sni=${DOMAIN}&fp=chrome&encryption=none$([[ "${net}" == "h2" ]] && echo '&alpn=h2')#$(url_encode "${CLIENT_REMARK}")"
     else
         # vmess v2 JSON base64; aid=0 走 AEAD, 带 scy/sni/fp 字段
         local json
@@ -2078,7 +2098,7 @@ build_share_link() {
 EOF
 )
         local b64
-        b64=$(printf '%s' "${json}" | openssl base64 -A | tr -d '=' | tr '+/' '-_')
+        b64=$(printf '%s' "${json}" | openssl base64 -A | tr -d '=')
         SHARE_URL="vmess://${b64}"
     fi
 }
@@ -2193,19 +2213,17 @@ show_mode_info() {
     fi
 }
 
-do_show_info() {
+# 从磁盘配置现场收集全部当前有效链接到传入的数组 (nameref)。
+# 被 do_show_info 与 rebuild_url_file_from_config 共用; 展示行由 do_show_info 自行组织。
+collect_current_urls() {
+    local -n _urls_ref="$1"
+    _urls_ref=()
     get_public_ip
-    local any=0
-    local out_lines=() exported=()
-    # 全部参数从实际配置文件现场提取 (不信任 INFO_FILE/URL_FILE 历史记录:
-    # 手工改过配置、或任何历史 bug 都可能让记录陈旧), 每次运行重建导出文件,
-    # 保证导出的链接与磁盘上的真实配置一致
-    local p ip proto section lines=() k v
+    local p ip proto
     ip="${PUBLIC_IP:-127.0.0.1}"
 
     # --- REALITY: 全部参数在 config_reality.json ---
     if [[ -f "${REALITY_CONF}" ]]; then
-        any=1
         p="$(grep -o '"port": [0-9]*' "${REALITY_CONF}" | head -1 | grep -o '[0-9]*')"
         local r_uuid r_sni r_sid r_pbk r_priv
         r_uuid="$(grep -o '"id": "[^"]*"' "${REALITY_CONF}" | head -1 | cut -d'"' -f4)"
@@ -2217,51 +2235,29 @@ do_show_info() {
         if [[ -z "${r_pbk}" ]]; then
             r_pbk="$(grep reality "${URL_FILE}" 2>/dev/null | tail -1 | grep -o 'pbk=[^&]*' | cut -d= -f2)"
         fi
-        local r_url
-        r_url="vless://${r_uuid}@${ip}:${p}?type=tcp&security=reality&pbk=${r_pbk}&sid=${r_sid}&sni=${r_sni}&fp=chrome&flow=xtls-rprx-vision&encryption=none#${r_sni}-reality"
-        out_lines+=("${GREEN}--- vless+REALITY ---${PLAIN}"
-            " 地址        : ${ip}"
-            " 端口        : ${p}"
-            " 用户 ID     : ${r_uuid}"
-            " 伪装目标    : $(grep -o '"dest": "[^"]*"' "${REALITY_CONF}" | head -1 | cut -d'"' -f4) (sni: ${r_sni})"
-            " 公钥 pbk    : ${r_pbk}"
-            " shortId sid : ${r_sid}"
-            " 分享链接: ${r_url}")
-        exported+=("${r_url}")
+        _urls_ref+=("vless://${r_uuid}@${ip}:${p}?type=tcp&security=reality&pbk=${r_pbk}&sid=${r_sid}&sni=${r_sni}&fp=chrome&flow=xtls-rprx-vision&encryption=none#${r_sni}-reality")
     fi
 
     # --- socks5: 全部参数在 config_socks.json ---
     if [[ -f "${SOCKS_CONF}" ]]; then
-        any=1
         p="$(grep -o '"port": [0-9]*' "${SOCKS_CONF}" | head -1 | grep -o '[0-9]*')"
         local s_user s_pass s_b64
         s_user="$(grep -o '"user": "[^"]*"' "${SOCKS_CONF}" | cut -d'"' -f4)"
         s_pass="$(grep -o '"pass": "[^"]*"' "${SOCKS_CONF}" | cut -d'"' -f4)"
-        s_b64=$(printf '%s' "${s_user}:${s_pass}" | openssl base64 -A | tr -d '=' | tr '+/' '-_')
-        local s_url s_plain
-        s_url="socks://${s_b64}@${ip}:${p}#socks5-${ip}"
-        s_plain="${ip}:${p}:${s_user}:${s_pass}{socks5-${ip}}"
-        out_lines+=("${GREEN}--- socks5 ---${PLAIN}"
-            " 地址        : ${ip}"
-            " 端口        : ${p}"
-            " 用户名      : ${s_user}"
-            " 密码        : ${s_pass}"
-            " 分享链接: ${s_url}"
-            " 工具格式: ${s_plain}")
-        exported+=("${s_url}" "${s_plain}")
+        s_b64=$(printf '%s' "${s_user}:${s_pass}" | openssl base64 -A | tr -d '=')
+        _urls_ref+=("socks://${s_b64}@${ip}:${p}#socks5-${ip}")
     fi
 
     # --- ws / h2: 域名从 nginx server_name 或证书 SAN 推导, 端口/uuid/path 从各自配置 ---
-    local m mode_label conf svc nginx_listen
+    local m conf svc
     for m in ws h2; do
         if [[ "${m}" == "ws" ]]; then
-            conf="${WS_CONF}"; mode_label="ws+tls"; svc="${WS_SERVICE}"
+            conf="${WS_CONF}"; svc="${WS_SERVICE}"
         else
-            conf="${H2_CONF}"; mode_label="h2+tls"; svc="${H2_SERVICE}"
+            conf="${H2_CONF}"; svc="${H2_SERVICE}"
         fi
         [[ -f "${conf}" ]] || continue
-        any=1
-        local m_uuid m_path m_port m_domain
+        local m_uuid m_path m_port m_domain m_proto
         m_uuid="$(grep -o '"id": "[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
         m_path="$(grep -o '"path": "/[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
         m_path="${m_path#/}"
@@ -2284,98 +2280,70 @@ do_show_info() {
             m_domain="$(openssl x509 -in "${CRT_FILE}" -noout -ext subjectAltName 2>/dev/null \
                 | grep -o 'DNS:[^,]*' | head -1 | cut -d: -f2)"
         fi
-        out_lines+=("${GREEN}--- ${mode_label} ---${PLAIN}"
-            " 域名        : ${m_domain:-未知 (证书未找到)}"
-            " 端口        : ${m_port}"
-            " 用户 ID     : ${m_uuid}"
-            " 路径        : /${m_path}")
-        if [[ -n "${m_domain}" && -n "${m_uuid}" ]]; then
-            local enc_path m_url
-            enc_path="$(url_encode "/${m_path}")"
-            if [[ "${m}" == "ws" ]]; then
-                # 协议按配置实际值生成对应格式链接 (vless URI / vmess v2 JSON)
-                proto="$(grep -o '"protocol": "[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
-                if [[ "${proto}" == "vmess" ]]; then
-                    local j b64
-                    j=$(cat <<EOF
+        [[ -n "${m_domain}" && -n "${m_uuid}" ]] || continue
+        local enc_path m_url
+        enc_path="$(url_encode "/${m_path}")"
+        m_proto="$(grep -o '"protocol": "[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
+        if [[ "${m_proto}" == "vmess" ]]; then
+            local j b64
+            j=$(cat <<EOF
 {
   "v": "2",
-  "ps": "${m_domain}-${proto}-ws",
+  "ps": "${m_domain}-${m_proto}-${m}",
   "add": "${m_domain}",
   "port": "${m_port}",
   "id": "${m_uuid}",
   "aid": "0",
   "scy": "auto",
-  "net": "ws",
+  "net": "${m}",
   "type": "none",
   "host": "${m_domain}",
   "path": "/${m_path}",
   "tls": "tls",
   "sni": "${m_domain}",
-  "alpn": "",
+  "alpn": "$([[ "${m}" == "h2" ]] && echo h2)",
   "fp": "chrome"
 }
 EOF
 )
-                    b64=$(printf '%s' "${j}" | openssl base64 -A | tr -d '=' | tr '+/' '-_')
-                    m_url="vmess://${b64}"
-                else
-                    m_url="vless://${m_uuid}@${m_domain}:${m_port}?type=ws&security=tls&host=${m_domain}&path=${enc_path}&sni=${m_domain}&fp=chrome&encryption=none#${m_domain}-${proto}-ws"
-                fi
-            else
-                proto="$(grep -o '"protocol": "[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
-                if [[ "${proto}" == "vmess" ]]; then
-                    local j2 b642
-                    j2=$(cat <<EOF
-{
-  "v": "2",
-  "ps": "${m_domain}-${proto}-h2",
-  "add": "${m_domain}",
-  "port": "${m_port}",
-  "id": "${m_uuid}",
-  "aid": "0",
-  "scy": "auto",
-  "net": "h2",
-  "type": "none",
-  "host": "${m_domain}",
-  "path": "/${m_path}",
-  "tls": "tls",
-  "sni": "${m_domain}",
-  "alpn": "h2",
-  "fp": "chrome"
-}
-EOF
-)
-                    b642=$(printf '%s' "${j2}" | openssl base64 -A | tr -d '=' | tr '+/' '-_')
-                    m_url="vmess://${b642}"
-                else
-                    m_url="vless://${m_uuid}@${m_domain}:${m_port}?type=h2&security=tls&host=${m_domain}&path=${enc_path}&sni=${m_domain}&fp=chrome&encryption=none#${m_domain}-${proto}-h2"
-                fi
-            fi
-            out_lines+=(" 分享链接: ${m_url}")
-            exported+=("${m_url}")
+            b64=$(printf '%s' "${j}" | openssl base64 -A | tr -d '=')
+            m_url="vmess://${b64}"
+        else
+            # h2 补 alpn=h2: 服务端 inbound 声明了 ["h2"], 客户端侧同步锁定握手协议
+            m_url="vless://${m_uuid}@${m_domain}:${m_port}?type=${m}&security=tls&host=${m_domain}&path=${enc_path}&sni=${m_domain}&fp=chrome&encryption=none$([[ "${m}" == "h2" ]] && echo '&alpn=h2')#${m_domain}-${m_proto}-${m}"
         fi
+        _urls_ref+=("${m_url}")
     done
+}
+
+do_show_info() {
+    local any=0
+    local out_lines=() exported=()
+    # 全部参数从实际配置文件现场提取 (不信任 INFO_FILE/URL_FILE 历史记录:
+    # 手工改过配置、或任何历史 bug 都可能让记录陈旧), 每次运行重建导出文件,
+    # 保证导出的链接与磁盘上的真实配置一致; 链接生成复用 collect_current_urls,
+    # 展示信息在此另行组织 (含工具格式等仅展示用行)
+    collect_current_urls exported
+    [[ ${#exported[@]} -gt 0 ]] && any=1
 
     if [[ "${any}" == "0" ]]; then
         log_warn "未找到任何已安装模式的配置。"
         return
     fi
 
+    local ol
+    for ol in "${exported[@]}"; do
+        out_lines+=(" 分享链接: ${ol}")
+    done
+
     clear
     echo -e "${GREEN}================ 已安装节点 (实时读取配置) ================${PLAIN}"
-    local ol
     for ol in "${out_lines[@]}"; do
         echo -e "${ol}"
     done
     echo -e "${GREEN}=============================================${PLAIN}"
     # 导出文件每次重建 (而非追加): 只含当前真实配置对应的链接, 旧链接不入文件
-    {
-        local ex
-        for ex in "${exported[@]}"; do
-            echo "${ex}"
-        done
-    } > "${URL_FILE}"
+    rebuild_url_file "${exported[@]}"
     log_confirm "全部分享链接已导出到: ${URL_FILE} (每次运行重建, 保证与当前配置一致)"
 }
 
@@ -2618,7 +2586,8 @@ do_reset_reality() {
 
     local new_url
     new_url="$(build_reality_link_from_conf)"
-    echo "${new_url}" >> "${URL_FILE}"
+    # 导出文件重建而非追加: 新链接替换旧 REALITY 链接, 文件里不残留失效链接
+    rebuild_url_file_from_config
     # 同步 INFO_FILE 的 reality 段落 (端口/UUID/链接), 保持菜单 7 与导出一致
     REALITY_PORT="$(grep -o '"port": [0-9]*' "${REALITY_CONF}" | head -1 | grep -o '[0-9]*')"
     UUID="$(grep -o '"id": "[^"]*"' "${REALITY_CONF}" | head -1 | cut -d'"' -f4)"
@@ -2848,7 +2817,9 @@ do_reset_node() {
         SOCKS_PORT="${SOCKS_PORT:-$(grep -o '"port": [0-9]*' "${conf}" | head -1 | grep -o '[0-9]*')}"
         SOCKS_USER="${SOCKS_USER:-$(grep -o '"user": "[^"]*"' "${conf}" | cut -d'"' -f4)}"
         SOCKS_PASS="${SOCKS_PASS:-$(grep -o '"pass": "[^"]*"' "${conf}" | cut -d'"' -f4)}"
-        CLIENT_REMARK="${CLIENT_REMARK:-socks5-node}"
+        # 备注与安装时/菜单 7 一致 (socks5-<ip>), 避免同节点出现两个名字
+        CLIENT_REMARK="${CLIENT_REMARK:-socks5-${PUBLIC_IP:-$(get_public_ip && echo "${PUBLIC_IP:-server}")}}"
+        CLIENT_REMARK="${CLIENT_REMARK//[$'\r\n']/}"
     else
         MODE="${mode_pick}"; PROTOCOL="vless"
         # 实际安装协议可能为 vmess (安装时决定), 从 info 段落名恢复, 保持段落名不变
@@ -2872,7 +2843,8 @@ do_reset_node() {
         CLIENT_REMARK="${DOMAIN}-${PROTOCOL}-${svc_label%%+*}"
     fi
     build_share_link
-    echo "${SHARE_URL}" >> "${URL_FILE}"
+    # 导出文件重建而非追加: 新链接替换旧链接, 文件里不残留失效链接
+    rebuild_url_file_from_config
     sync_info_block "$([[ "${MODE}" == "socks" ]] && echo "socks" || echo "${PROTOCOL}+${svc_label%%+*}")" "${SHARE_URL}"
 
     echo
@@ -3046,7 +3018,8 @@ do_change_reality_dest() {
     ip="$(curl -4 -s --max-time 8 https://api.ip.sb/ip || curl -4 -s --max-time 8 https://api.ipify.org)"
     ip="${ip//[$'\r\n']/}"
     new_url="vless://${uuid}@${ip}:${cur_port}?type=tcp&security=reality&pbk=${cur_pubkey}&sid=${cur_sid}&sni=${REALITY_SNI}&fp=chrome&flow=xtls-rprx-vision&encryption=none#${REALITY_SNI}-reality"
-    echo "${new_url}" >> "${URL_FILE}"
+    # 导出文件重建而非追加: 换站后旧 REALITY 链接 (旧 sni) 不再残留
+    rebuild_url_file_from_config
     # 同步 INFO_FILE 的 dest/sni/share_url
     MODE="reality"; REALITY_PORT="${cur_port}"; UUID="${uuid}"
     sync_info_block "vless+reality" "${new_url}"
