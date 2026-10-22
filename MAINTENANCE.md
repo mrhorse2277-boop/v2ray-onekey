@@ -4,7 +4,7 @@
 
 ## 仓库与部署
 
-- 唯一交付物是 `install.sh`(约 3200 行,单文件 self-contained,无外部依赖文件)
+- 唯一交付物是 `install.sh`(约 3250 行,单文件 self-contained,无外部依赖文件)
 - GitHub 仓库:`mrhorse2277-boop/v2ray-onekey`(main 分支)
 - 本机推送走本机代理(10809 已停,用 socks5h://127.0.0.1:10808;DNS 也走代理避免解析污染):
   `git -c http.proxy=socks5h://127.0.0.1:10808 -c credential.helper= -c credential.helper="manager" push`
@@ -58,8 +58,10 @@
   install-release.sh,脚本不硬编码版本号,长期不更新也能装到最新 core。
   ensure_v2ray/ensure_xray 只判断"有没有",升级走菜单 9(无条件重跑安装脚本+重启服务)
 - **INFO_FILE**(`/usr/local/etc/v2ray/v2ray_info.txt`):`### <section>` 段落 + key=value,
-  段落名是 share_url 的唯一定位键——**改端口/UUID/换站后必须调 sync_info_block 同步**,
-  卸载时 sed 删除的段落名必须与 append_info 写入的一致(8b0f105 修过的失配坑)
+  仅存节点参数(端口/UUID/凭据等)供菜单内部快速读取;**share_url 已不从 INFO_FILE 生成**——
+  菜单 7 与 10/11/12 一律从实际配置现场生成(b8e5b6b),INFO_FILE 各段落仍由
+  sync_info_block 在改端口/UUID/换站后同步,卸载时 sed 删除的段落名必须与
+  append_info 写入的一致(8b0f105 修过的失配坑)
 - **非交互兼容**:所有交互点必须 `[[ -t 0 ]]` 判断,CLI 子命令/管道下跳过询问走默认值
   (pick_port 随机、REALITY 选延迟最低站)。破坏了这条,一键命令就不能用了
 - **取消路径**:pick_port 返回 1 = 用户 b 取消;安装场景 return 1 中止,

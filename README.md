@@ -171,7 +171,7 @@ Debian 11/12/13、Ubuntu 18.04/20.04/22.04/24.04 真机完整测试
 | `/usr/local/etc/xray/config_reality.json` | Xray REALITY 配置 |
 | `/usr/local/etc/v2ray/v2ray_info.txt` | 全部节点信息(脚本保存) |
 | `/usr/local/etc/v2ray/used_ports.txt` | 已分配端口记录 |
-| `/root/v2ray_share_url.txt` | 全部分享链接(追加式) |
+| `/root/v2ray_share_url.txt` | 全部分享链接(每次运行菜单 7 重建, 只含当前有效链接) |
 | `/etc/nginx/conf.d/v2ray-ws-tls.conf` | Nginx 站点配置(仅 ws 模式) |
 | `/home/wwwroot/v2ray-web/` | 伪装站点根目录 |
 | `/data/v2ray.crt`、`/data/v2ray.key` | 证书与私钥(ws 与 h2 共用) |
