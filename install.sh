@@ -40,7 +40,7 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.4.2"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 
 CERT_DIR="/data"
@@ -2069,14 +2069,24 @@ build_share_link() {
     fi
 
     if [[ "${PROTOCOL}" == "vless" ]]; then
-        # vless 标准 URI: encryption=none; h2 的 type 为 h2, path URL 编码
+        # vless 标准 URI: encryption=none; path URL 编码
+        # h2 用 type=http (客户端白名单字段) + alpn=h2 锁定 HTTP/2:
+        # 最新 v2rayN 的 Networks 白名单不含 h2 (type=h2 会被当 raw 导入导致连接失败),
+        # v2rayNG 导出 h2 时也统一写 type=http 且与服务端 alpn=["h2"] 对齐
         local enc_path
         enc_path="$(url_encode "/${WS_PATH}")"
-        # h2 补 alpn=h2: 服务端 inbound 声明了 ["h2"], 客户端侧同步锁定握手协议
-        SHARE_URL="vless://${UUID}@${DOMAIN}:${port}?type=${net}&security=tls&host=${DOMAIN}&path=${enc_path}&sni=${DOMAIN}&fp=chrome&encryption=none$([[ "${net}" == "h2" ]] && echo '&alpn=h2')#$(url_encode "${CLIENT_REMARK}")"
+        if [[ "${net}" == "h2" ]]; then
+            SHARE_URL="vless://${UUID}@${DOMAIN}:${port}?type=http&security=tls&host=${DOMAIN}&path=${enc_path}&sni=${DOMAIN}&fp=chrome&encryption=none&alpn=h2#$(url_encode "${CLIENT_REMARK}")"
+        else
+            SHARE_URL="vless://${UUID}@${DOMAIN}:${port}?type=${net}&security=tls&host=${DOMAIN}&path=${enc_path}&sni=${DOMAIN}&fp=chrome&encryption=none#$(url_encode "${CLIENT_REMARK}")"
+        fi
     else
         # vmess v2 JSON base64; aid=0 走 AEAD, 带 scy/sni/fp 字段
         local json
+        # vmess v2 JSON base64; aid=0 走 AEAD, 带 scy/sni/fp 字段
+        # h2 模式 net=http + alpn=h2 (与 vless 同因: 客户端白名单不含 h2, alpn 锁定 HTTP/2)
+        local net_field="${net}"
+        [[ "${net}" == "h2" ]] && net_field="http"
         json=$(cat <<EOF
 {
   "v": "2",
@@ -2086,13 +2096,13 @@ build_share_link() {
   "id": "${UUID}",
   "aid": "0",
   "scy": "auto",
-  "net": "${net}",
+  "net": "${net_field}",
   "type": "none",
   "host": "${DOMAIN}",
   "path": "/${WS_PATH}",
   "tls": "tls",
   "sni": "${DOMAIN}",
-  "alpn": "",
+  "alpn": "$([[ "${net}" == "h2" ]] && echo h2)",
   "fp": "chrome"
 }
 EOF
@@ -2203,9 +2213,8 @@ show_mode_info() {
 
     append_info "$([[ "${PROTOCOL}" ]] && echo "${PROTOCOL}+${MODE}" || echo "${MODE}")"
 
-    # 追加到总链接文件
-    echo "${SHARE_URL}" >> "${URL_FILE}"
-    [[ -n "${SHARE_URL_PLAIN:-}" ]] && echo "${SHARE_URL_PLAIN}" >> "${URL_FILE}"
+    # 导出文件整体重建 (非追加): 只含当前真实配置对应的链接, 已卸载模式的失效链接不入文件
+    rebuild_url_file_from_config
 
     if command -v qrencode >/dev/null 2>&1; then
         echo -e "${BLUE}客户端扫码导入:${PLAIN}"
@@ -2284,6 +2293,9 @@ collect_current_urls() {
         local enc_path m_url
         enc_path="$(url_encode "/${m_path}")"
         m_proto="$(grep -o '"protocol": "[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
+        # h2 的客户端侧网络名统一用 http (客户端白名单不含 h2), alpn=h2 锁定 HTTP/2
+        local net_field="${m}"
+        [[ "${net_field}" == "h2" ]] && net_field="http"
         if [[ "${m_proto}" == "vmess" ]]; then
             local j b64
             j=$(cat <<EOF
@@ -2295,7 +2307,7 @@ collect_current_urls() {
   "id": "${m_uuid}",
   "aid": "0",
   "scy": "auto",
-  "net": "${m}",
+  "net": "${net_field}",
   "type": "none",
   "host": "${m_domain}",
   "path": "/${m_path}",
@@ -2309,8 +2321,7 @@ EOF
             b64=$(printf '%s' "${j}" | openssl base64 -A | tr -d '=')
             m_url="vmess://${b64}"
         else
-            # h2 补 alpn=h2: 服务端 inbound 声明了 ["h2"], 客户端侧同步锁定握手协议
-            m_url="vless://${m_uuid}@${m_domain}:${m_port}?type=${m}&security=tls&host=${m_domain}&path=${enc_path}&sni=${m_domain}&fp=chrome&encryption=none$([[ "${m}" == "h2" ]] && echo '&alpn=h2')#${m_domain}-${m_proto}-${m}"
+            m_url="vless://${m_uuid}@${m_domain}:${m_port}?type=${net_field}&security=tls&host=${m_domain}&path=${enc_path}&sni=${m_domain}&fp=chrome&encryption=none$([[ "${m}" == "h2" ]] && echo '&alpn=h2')#${m_domain}-${m_proto}-${m}"
         fi
         _urls_ref+=("${m_url}")
     done
@@ -2450,31 +2461,9 @@ do_uninstall() {
         *) return ;;
     esac
     systemctl daemon-reload
-    # 同步清理 URL_FILE 中已卸载模式的链接行 (保留仍在运行的模式的链接)
-    if [[ -f "${URL_FILE}" ]]; then
-        local keep=() line is_reality=0 is_ws=0 is_h2=0 is_socks=0
-        [[ -f "/etc/systemd/system/${REALITY_SERVICE}.service" ]] && is_reality=1
-        [[ -f "/etc/systemd/system/${WS_SERVICE}.service" ]] && is_ws=1
-        [[ -f "/etc/systemd/system/${H2_SERVICE}.service" ]] && is_h2=1
-        [[ -f "/etc/systemd/system/${SOCKS_SERVICE}.service" ]] && is_socks=1
-        while IFS= read -r line; do
-            [[ -z "${line}" ]] && continue
-            if [[ "${line}" == reality* || "${line}" == *security=reality* ]]; then
-                [[ "${is_reality}" == "1" ]] && keep+=("${line}")
-            elif [[ "${line}" == *type=ws* || "${line}" == *-vless-ws* ]]; then
-                [[ "${is_ws}" == "1" ]] && keep+=("${line}")
-            elif [[ "${line}" == *type=h2* ]]; then
-                [[ "${is_h2}" == "1" ]] && keep+=("${line}")
-            elif [[ "${line}" == socks* ]]; then
-                [[ "${is_socks}" == "1" ]] && keep+=("${line}")
-            else
-                keep+=("${line}")
-            fi
-        done < "${URL_FILE}"
-        printf '%s
-' "${keep[@]}" > "${URL_FILE}" 2>/dev/null || rm -f "${URL_FILE}"
-    fi
-    # used_ports: 剔除已卸载模式占用的端口 (按 systemd 服务存在与否无法判断端口, 简化为全部卸载时清空, 单模式保留)
+    # 导出文件整体重建: 只保留仍安装模式的链接 (链接一律从实际配置现场生成,
+    # 卸载后其配置已删, 重建自然剔除该模式的链接, 含 vmess/base64 等无法按特征匹配的行)
+    rebuild_url_file_from_config
     log_info "卸载完成。"
 }
 
