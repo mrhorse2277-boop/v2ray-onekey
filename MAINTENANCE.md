@@ -2,6 +2,9 @@
 
 面向后续维护者。用户视角的功能说明见 [README.md](README.md),这里只写"改代码之前需要知道的事"。
 
+> **AI agent 必须先读 [AGENTS.md](AGENTS.md)** —— 硬性门禁:知识库(docs/kb、docs/upstream)
+> 只留本地严禁推送、push 即发布、SCRIPT_VERSION 手动递增等禁令都在那里。
+
 ## 仓库与部署
 
 - 唯一交付物是 `install.sh`(约 3250 行,单文件 self-contained,无外部依赖文件)
@@ -81,6 +84,14 @@
 - **降权与权限**:服务以 nobody 运行,配置文件必须 `root:nogroup 640`
   (`fix_config_perm`);任何 sed -i 改配置的路径之后都要补一次属组修正,
   否则服务读不到配置起不来
+
+## 本地资料库 (docs/kb + docs/upstream, 仅本地)
+
+客户端(v2rayN/v2rayNG)分享链接解析与配置生成的源码资料库,纯本地,不入 git
+(排除靠 `.git/info/exclude`,勿删)。结构/保鲜命令/去旧规则见
+[docs/kb/UPDATE.md](docs/kb/UPDATE.md),提炼笔记见 [docs/kb/SPEC.md](docs/kb/SPEC.md)。
+改 install.sh 链接生成前先 `bash docs/kb/update_kb.sh --check` 确认快照新旧;
+收录文件与上游冲突时 `--sync` 同步;上游删除/改名报 EXPIRED 由人重定位。
 
 ## 常用调试命令
 
