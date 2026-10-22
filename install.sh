@@ -40,7 +40,7 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.4.0"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 
 CERT_DIR="/data"
@@ -3091,6 +3091,7 @@ show_menu() {
     echo -e "12. 重置 ws/h2/socks 节点 (端口 / UUID / 用户密码)"
     echo -e "13. 卸载 (可选单模式或全部)"
     echo -e "14. 更新脚本 (从 GitHub 下载最新版覆盖本脚本)"
+    echo -e "15. 升级已装节点配置 (保留 UUID/端口/密钥, 补齐新版功能)"
     echo -e " 0. 退出"
     echo
     read -rp "请选择: " choice || exit 0
@@ -3109,6 +3110,7 @@ show_menu() {
         12) do_reset_node ;;
         13) do_uninstall ;;
         14) do_self_update ;;
+        15) do_upgrade_nodes ;;
         0) exit 0 ;;
         *) ;;
     esac
@@ -3120,6 +3122,119 @@ do_renew_cert() {
         return
     fi
     bash "${SSL_UPDATE_SH}"
+}
+
+# ---------- 已装节点配置升级 (菜单 15) ----------
+# 机制: 配置模板随脚本版本演进 (如 1.3.0 的 freedom UseIPv4), 已安装机器的存量配置
+# 不会自动跟上。这里登记按版本排序的迁移补丁, 菜单 15 按序补跑未应用的迁移:
+# 每条补丁幂等 (先检测字段已存在则跳过)、改前备份、改后 validate_core_config 校验,
+# 失败自动回滚。已应用记录写 MIGRATION_STATE (版本|迁移名 一行一条)。
+# 【维护纪律】改任何配置模板必须同步在此追加一条迁移 (见 AGENTS.md 门禁)。
+
+MIGRATION_STATE="${V2RAY_CONF_DIR}/migrations_done.txt"
+
+# 迁移注册表: "版本|函数名|描述" (按版本从旧到新排序, 追加到末尾)
+MIGRATIONS=(
+    "1.3.0|migr_useipv4|所有模式 freedom 出站补 domainStrategy=UseIPv4"
+)
+
+# --- 迁移: 1.3.0 freedom 出站 UseIPv4 ---
+# 配置由本脚本生成, JSON 结构固定: "protocol": "freedom" 后跟 "settings": {...}。
+# 已带 domainStrategy 的配置 (1.3.0 起安装) 检测后跳过, 幂等。
+migr_useipv4() {
+    local conf="$1" bin="$2"
+    [[ -f "${conf}" ]] || return 0   # 该模式未安装, 跳过
+    if grep -q '"domainStrategy"' "${conf}"; then
+        return 0   # 已有字段, 幂等跳过
+    fi
+    # 在 freedom outbound 的 "protocol": "freedom", 行后插入 settings 块
+    # (本脚本生成的配置 freedom 恒带尾逗号, 该行结构唯一可定位)
+    if ! sed -i '/"protocol": "freedom",/a\      "settings": {\n        "domainStrategy": "UseIPv4"\n      },' "${conf}" \
+        || ! grep -q '"domainStrategy": "UseIPv4"' "${conf}"; then
+        return 1
+    fi
+    validate_core_config "${bin}" "${conf}" || return 1
+    fix_config_perm "${conf}"
+    return 0
+}
+
+# 迁移通用执行器: 逐条检查 state, 未应用的执行, 失败回滚该条并继续报告
+do_upgrade_nodes() {
+    check_root
+    local applied=0 skipped=0 failed=0
+    local any_installed=0
+    for c in "${REALITY_CONF}" "${WS_CONF}" "${H2_CONF}" "${SOCKS_CONF}"; do
+        [[ -f "${c}" ]] && any_installed=1
+    done
+    if [[ "${any_installed}" == "0" ]]; then
+        log_warn "未检测到已安装的节点,无需升级。"
+        return 0
+    fi
+    touch "${MIGRATION_STATE}" 2>/dev/null || { log_error "无法写入迁移状态文件 (${MIGRATION_STATE})"; return 1; }
+    echo -e "${GREEN}========== 已装节点配置升级 (保留 UUID/端口/密钥) ==========${PLAIN}"
+    log_info "脚本版本 v${SCRIPT_VERSION},待检迁移 ${#MIGRATIONS[@]} 条。"
+
+    local entry ver fn desc conf bin svc_name need_restart=()
+    for entry in "${MIGRATIONS[@]}"; do
+        ver="${entry%%|*}"; rest="${entry#*|}"
+        fn="${rest%%|*}"; desc="${rest#*|}"
+        if grep -q "^${ver}|${fn}$" "${MIGRATION_STATE}" 2>/dev/null; then
+            skipped=$((skipped+1))
+            continue
+        fi
+        echo
+        log_info "[迁移 ${ver}] ${desc}"
+        local entry_failed=0
+        # 五种模式逐个补 (未安装的配置在迁移函数内部检测后跳过)
+        for pair in "${REALITY_CONF}:/usr/local/bin/xray:${REALITY_SERVICE}" \
+                    "${WS_CONF}:/usr/local/bin/v2ray:${WS_SERVICE}" \
+                    "${H2_CONF}:/usr/local/bin/v2ray:${H2_SERVICE}" \
+                    "${SOCKS_CONF}:/usr/local/bin/v2ray:${SOCKS_SERVICE}"; do
+            conf="${pair%%:*}"
+            bin="${pair#*:}"; bin="${bin%%:*}"
+            svc_name="${pair##*:}"
+            [[ -f "${conf}" ]] || continue
+            cp -a "${conf}" "${conf}.migrbak" || { entry_failed=1; break; }
+            if ! "${fn}" "${conf}" "${bin}"; then
+                log_error "  ${svc_name}: 迁移失败,已回滚。"
+                mv -f "${conf}.migrbak" "${conf}"
+                fix_config_perm "${conf}"
+                entry_failed=1
+                break
+            fi
+            rm -f "${conf}.migrbak"
+            need_restart+=("${svc_name}")
+        done
+        if [[ "${entry_failed}" == "1" ]]; then
+            failed=$((failed+1))
+        else
+            echo "${ver}|${fn}" >> "${MIGRATION_STATE}"
+            applied=$((applied+1))
+            log_confirm "  [${ver}] 完成。"
+        fi
+    done
+
+    # 重启受影响的服务 (有实际改动才重启, 秒级断连客户端自动重连)
+    local restarted=()
+    for svc_name in "${need_restart[@]:-}"; do
+        [[ -z "${svc_name}" ]] && continue
+        [[ " ${restarted[*]} " == *" ${svc_name} "* ]] && continue
+        systemctl restart "${svc_name}" 2>/dev/null && restarted+=("${svc_name}")
+    done
+
+    echo
+    echo -e "${GREEN}=============================================${PLAIN}"
+    log_confirm "升级完成: 应用 ${applied} 条, 已是最新 ${skipped} 条, 失败 ${failed} 条。"
+    if [[ ${#restarted[@]} -gt 0 ]]; then
+        log_confirm "已重启服务: ${restarted[*]}"
+    fi
+    if [[ "${failed}" != "0" ]]; then
+        log_warn "有迁移失败,请查看上方错误信息;失败条目未记录,修复后重跑本菜单会再次尝试。"
+        return 1
+    fi
+    # 升级后链接参数可能变化, 重建导出文件保证与当前配置一致
+    rebuild_url_file_from_config
+    return 0
 }
 
 # 从 GitHub 下载最新脚本覆盖本地: 校验通过才替换, 失败保留原脚本
@@ -3163,6 +3278,10 @@ do_self_update() {
     if mv -f "${tmp}" "${self_path}" && chmod +x "${self_path}"; then
         rm -f "${self_path}.bak.$$"
         log_info "更新完成: v${SCRIPT_VERSION} -> v${new_ver}。重新运行 bash ${self_path} 生效。"
+        # 新版脚本若有待执行迁移, 提示跑升级 (已装机器追平新配置)
+        if bash -c "grep -q 'MIGRATIONS=' '${self_path}'" 2>/dev/null; then
+            log_confirm "提示: 若本机已安装节点, 建议再运行一次菜单 15 (升级已装节点配置), 补齐新版脚本的配置变更。"
+        fi
         exit 0
     else
         log_error "替换失败,已回滚到原脚本。"
@@ -3196,6 +3315,10 @@ main() {
                 ;;
             info)
                 do_show_info
+                exit 0
+                ;;
+            upgrade)
+                do_upgrade_nodes
                 exit 0
                 ;;
             uninstall)

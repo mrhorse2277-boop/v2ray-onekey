@@ -27,7 +27,12 @@ raw 拉取源,**没有版本分支/tag 隔离**:
 
 ## 3. 其他既有硬规则 (详见 MAINTENANCE.md)
 
+- **每次维护/更新脚本, 推送前必须完整测试已装代理的可用性**:至少覆盖
+  服务 active、REALITY 握手 (Verify return code: 0)、socks5 实测连通
+  (curl --proxy 204)、菜单 7 链接生成正确——只跑 bash -n / 静态检查不算测过
 - 改 install.sh 必须手动递增 `SCRIPT_VERSION`(菜单 14 版本对比唯一依据)
+- **改任何配置模板必须同步登记迁移补丁**(菜单 15 机制):在 MIGRATIONS 数组
+  追加 "版本|函数|描述" 并实现幂等迁移函数, 保证已安装机器跑一次菜单 15 就能追平
 - 在用户 VPS 上测试后必须把改动的配置恢复原样
 - 链接生成一律从实际配置文件现场生成, 不信任 INFO_FILE/URL_FILE 历史值
 - 五个配置模板的 freedom outbound `domainStrategy: UseIPv4` 不可丢失

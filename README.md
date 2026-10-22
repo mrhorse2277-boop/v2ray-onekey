@@ -136,6 +136,7 @@ bash install.sh reality && bash install.sh ws vless && bash install.sh socks
 | 12 | 重置 ws/h2/socks 节点(端口 / UUID / 用户密码) |
 | 13 | 卸载(单模式或全部) |
 | 14 | 更新脚本(从 GitHub 下载最新版覆盖本地脚本,带合法性/语法校验与回滚) |
+| 15 | 升级已装节点配置(保留 UUID/端口/密钥,按序补跑新版脚本的配置迁移) |
 | 0 | 退出 |
 
 重置端口/安装端口支持"默认/随机/自定义"三选一(见上文端口选择)。
@@ -150,6 +151,14 @@ bash install.sh reality && bash install.sh ws vless && bash install.sh socks
 
 所有模式的代理出站固定走 **IPv4**(freedom 出站 `domainStrategy: UseIPv4`),
 避免 VPS 的 IPv6 回程质量不稳导致部分站点访问异常。
+
+## 已装机器升级
+
+已安装过旧版脚本的机器:先菜单 14 把脚本本体更新到最新,再跑一次**菜单 15**——
+在保留 UUID/密码/密钥/端口/伪装站/证书的前提下,把新版脚本引入的配置变更按序补进
+现有配置(每条迁移幂等、改前备份、改后校验、失败自动回滚),完成后自动重启受影响的
+服务并重建导出链接。CLI 等价命令 `bash install.sh upgrade`。
+1.3.0 起的所有配置级变更(如出站固定 IPv4)都通过该机制向存量机器追平。
 
 ## 先装代理后装宝塔
 
