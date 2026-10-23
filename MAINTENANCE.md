@@ -25,6 +25,11 @@
 
 ## 每轮测试清单
 
+> **先判定改动类型**:若改动涉及系统依赖面(shell 语法/systemd unit/外部命令/
+> 包管理器/用户组权限/防火墙/core 安装或配置模板), 按 AGENTS.md 第 3 节
+> **必须在六个主打系统(Debian 11/12/13 + Ubuntu 18.04~24.04)上跑全矩阵**,
+> 方法见 AGENTS.md 第 4 节。下列 1-7 项是单系统内的检查内容, 两者配合使用。
+
 1. `bash -n install.sh` 本地语法检查;有条件时 shellcheck(error 级必须为零)
 2. 安装四模式:reality(443)→ socks → ws(443 被占自动落独立端口)→ xhttp(独立端口)
 3. 验证:REALITY 握手(`openssl s_client -connect 127.0.0.1:443 -servername <sni>`,
