@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 参考 [wulabing/V2Ray_ws-tls_bash_onekey](https://github.com/wulabing/V2Ray_ws-tls_bash_onekey) 的架构重写,
-支持 **ws+tls / h2+tls / socks5 / vless+REALITY 四种模式同时安装、互不冲突**,分享链接适配最新版
+支持 **ws+tls / xhttp+tls / socks5 / vless+REALITY 四种模式同时安装、互不冲突**,分享链接适配最新版
 [v2rayN](https://github.com/2dust/v2rayN) / [v2rayNG](https://github.com/2dust/v2rayNG) 正式版。
 
 > 维护者请先读 [MAINTENANCE.md](MAINTENANCE.md)——架构要点、版本敏感点、每轮测试清单都在那里。
@@ -13,25 +13,98 @@
 | 模式 | 端口 | TLS/伪装 | 组件 | 抗封锁 |
 |---|---|---|---|---|
 | vmess/vless + ws + tls | 443 | Nginx TLS 终结 + 静态伪装站 | Nginx + acme.sh 证书 | 中 |
-| vmess/vless + h2 + tls | 随机独立端口 | V2Ray 直接 TLS | 不依赖 Nginx | 中 |
+| vmess/vless + xhttp + tls | 随机独立端口 | Xray 直接 TLS | 不依赖 Nginx | 中 |
 | socks5 (带认证) | 随机独立端口 | 明文 | V2Ray socks 入站 | 无 |
 | **vless + REALITY** | 443(空闲时)/随机 | Xray REALITY,借用真实大站证书 | Xray core | **强(推荐)** |
 
 四种模式各自使用独立的:
 
-- 配置文件:`config_ws.json` / `config_h2.json` / `config_socks.json` / `config_reality.json`
-- systemd 服务:`v2ray-ws` / `v2ray-h2` / `v2ray-socks` / `xray-reality`
-- 核心:V2Ray (ws/h2/socks) + Xray (REALITY),分别用官方脚本安装
+- 配置文件:`config_ws.json` / `config_xhttp.json` / `config_socks.json` / `config_reality.json`
+- systemd 服务:`v2ray-ws` / `xray-xhttp` / `v2ray-socks` / `xray-reality`
+- 核心:V2Ray (ws/socks) + Xray (xhttp/REALITY),分别用官方脚本安装
 - 端口:安装时自动分配并查重(`used_ports.txt` 记录),任意组合互不占用
 
-> 说明:原项目 h2 模式是 V2Ray 直接占 443、Nginx 退出,因此原版 h2 与 ws 天然互斥;
-> 本脚本把 h2 改为独立端口直连,才能与 ws(443)共存。REALITY 在 443 空闲时用 443,
+> **为什么是 xhttp 而不是 h2**:Xray 自 v24.12.31 起**删除**了 HTTP(h2) 传输
+> (`The feature HTTP transport ... has been removed`),v2rayN 的传输白名单也已移除
+> h2/http,v2rayNG 内置内核同步删除——h2 节点对当前所有客户端都已失效。
+> xhttp 是 Xray 官方指定的继任者(2024-11 起两个客户端均支持),本脚本 1.5.0 起
+> 该模式改用 xhttp 传输并使用 Xray 核心。**已装 h2 的机器跑一次菜单 15 即可自动迁移**
+> (保留 UUID/端口/路径,服务从 `v2ray-h2` 换成 `xray-xhttp`)。
+>
+> 历史说明:原项目的 h2 模式是 V2Ray 直接占 443、Nginx 退出,因此原版 h2 与 ws 天然互斥;
+> 本脚本把它改为独立端口直连,才能与 ws(443)共存。REALITY 在 443 空闲时用 443,
 > 已被 ws 占用时自动落到独立端口,同样可共存。
 
 ## 支持系统
 
-Debian 10+ / Ubuntu 18.04+ / CentOS 7+/Rocky/AlmaLinux,推荐 Debian 11+ 或 Ubuntu 20.04+。
-(CentOS 7 已 EOL,可能需先切换 vault 源;CentOS 8 已停止维护,建议 Rocky/Alma)
+### 推荐安装系统
+
+**Debian 12** 或 **Ubuntu 22.04 / 24.04**。
+
+### 测试覆盖的实际情况
+
+| 发行版 | 版本 | 状态 | 实测内容 |
+|---|---|---|---|
+| Debian | **11 / 12 / 13** | ✅ **实测通过** | 12 为 VPS 真机全量回归;11/13 在独立发行版用户空间(systemd-nspawn)完整跑通 |
+| Ubuntu | **18.04 / 20.04 / 22.04 / 24.04** | ✅ **实测通过** | 均在独立发行版用户空间完整跑通 |
+| CentOS | 8 | ⚠️ 代码级支持,未验证 | — |
+| Rocky / AlmaLinux | 8 / 9 | ⚠️ 代码级支持,未验证 | — |
+| Fedora / Oracle Linux / RHEL | — | ⚠️ 代码级支持,未验证 | — |
+| **CentOS 7** | 7 | ❌ **不支持** | bash 4.2 / systemd 219 低于门槛 |
+
+**1.5.0 对 Debian 11/12/13 与 Ubuntu 18.04~24.04 的实测项目**(每个版本都跑):
+
+1. `bash -n` 语法检查
+2. 版本预检 + 组名探测(`nogroup` 在六个版本上均正确)
+3. OpenSSL 能力检测(18.04 的 1.1.0g 正确走降级路径,其余走严格 TLS1.3)
+4. socks5 真实安装 → 服务 `active`、`User=nobody`/`Group=nogroup`、端口监听、配置 `root:nogroup 640`
+5. 代理实测连通(**HTTP 200**)
+6. 菜单 7 链接生成(含两种工具格式)
+7. 卸载 → 服务 inactive、配置文件删除干净
+
+> **测试环境说明**:Debian 12 是 VPS 真机;其余五个版本用 `debootstrap` 引导真实发行版
+> 用户空间 + `systemd-nspawn` 启动真实 systemd 跑测(非模拟、非容器化阉割)。
+> 差异在于共享宿主内核,未覆盖:内核参数、云厂商安全组、独立磁盘/网卡驱动。
+>
+> **未验证项**:REALITY / ws / xhttp 三模式的完整安装(需要域名+证书,容器内不便申请),
+> 以及菜单 10/11/12/15 的交互流程。这些在 Debian 12 真机上已验证。
+
+### 技术依赖(可自行核对你的系统)
+
+| 依赖 | 最低要求 | 各版本基线 |
+|---|---|---|
+| bash | **4.3+**(脚本用 `local -n` nameref) | Debian 11+: 5.1+;Ubuntu 18.04+: 4.4+ |
+| systemd | **229+**(`AmbientCapabilities`) | Debian 11+: 247+;Ubuntu 18.04+: 237+ |
+| 包管理器 | apt-get / dnf / yum 之一 | — |
+
+### OpenSSL 版本兼容(1.5.0 已修复)
+
+旧版 OpenSSL 缺两个脚本用到的能力,**1.5.0 之前会导致 Ubuntu 18.04 上 REALITY 完全装不上**:
+
+| 用法 | 需要版本 | 低版本表现 | 修复方式 |
+|---|---|---|---|
+| `openssl s_client -tls1_3` | 1.1.1+ | `Option unknown option -tls1_3`,探测输出为空 | 自动检测,降级到 `-tls1_2` 握手校验 |
+| `openssl x509 -ext subjectAltName` | 1.1.1+ | `x509: Unknown digest ext` | 降级到 `-text` 全文解析 |
+
+Ubuntu 18.04 自带 OpenSSL **1.1.0g**,以上两条都会触发。修复后实测:三个候选伪装站
+在 1.1.0g 下全部通过校验(修复前全部被判失败);Debian 12(OpenSSL 3.0)仍走严格
+TLS1.3 路径,未被降级。
+
+> 降级判定偏松(只验 TLS1.2 握手可达),可能放过个别不支持 TLS1.3 的站,
+> 但远好过全部判死导致装不上。REALITY 本身仍按 Xray 要求工作。
+
+**为什么 CentOS 7 不支持**:它的 bash 是 4.2,不支持 `local -n`(nameref 自 4.3 引入),
+脚本的 REALITY 选站与菜单 7 链接收集会直接报 `local: -n: invalid option`;
+且 systemd 219 低于 `AmbientCapabilities` 所需的 229,REALITY 监听 443 会失败。
+脚本会在预检阶段明确拒绝,而不是中途出错。
+
+> **RHEL 系请谨慎使用。** 脚本对该系列做了代码级适配(包管理器分支、组名探测、
+> SELinux 放行),但**没有在真机上跑过完整安装/卸载/迁移回归**。已知差异包括:
+> systemd 版本、`nobody` 组名、SELinux Enforcing 策略、firewalld 行为、
+> nginx 打包方式等。安装时会打印醒目警告,交互模式下要求确认;
+> 非交互模式只警告不阻塞(避免一键命令被卡住)。
+
+CentOS 8 已停止维护。
 
 ## 与已有网站 / 宝塔面板共存
 
@@ -56,7 +129,7 @@ Debian 10+ / Ubuntu 18.04+ / CentOS 7+/Rocky/AlmaLinux,推荐 Debian 11+ 或 Ubu
 
 ## 使用
 
-准备:境外 VPS。ws 与 h2 模式需要域名(已解析 A 记录);socks5 和 REALITY **不需要域名和证书**。
+准备:境外 VPS。ws 与 xhttp 模式需要域名(已解析 A 记录);socks5 和 REALITY **不需要域名和证书**。
 
 ```bash
 # 一键下载并进入交互菜单 (将 mrhorse2277-boop/v2ray-onekey 替换为实际仓库路径)
@@ -65,8 +138,8 @@ wget -N --no-check-certificate -q -O install.sh "https://raw.githubusercontent.c
 # 非交互
 bash install.sh ws vmess     # vmess + ws + tls (Nginx, 443)
 bash install.sh ws vless     # vless + ws + tls
-bash install.sh h2 vmess     # vmess + h2 + tls (独立端口)
-bash install.sh h2 vless     # vless + h2 + tls
+bash install.sh xhttp vmess  # vmess + xhttp + tls (独立端口, 旧参数 h2 仍接受)
+bash install.sh xhttp vless  # vless + xhttp + tls
 bash install.sh socks        # socks5 (随机用户名/密码, 独立端口)
 bash install.sh reality      # vless + REALITY (抗封锁首选, 免域名/证书)
 bash install.sh info         # 查看全部已安装节点并导出链接
@@ -90,10 +163,10 @@ bash install.sh reality && bash install.sh ws vless && bash install.sh socks
 
 ### 端口选择
 
-所有需要端口的操作(安装 ws 独立端口/h2/socks5/REALITY、菜单 11/12 重置端口)都会询问:
+所有需要端口的操作(安装 ws 独立端口/xhttp/socks5/REALITY、菜单 11/12 重置端口)都会询问:
 
 ```
-  1. 使用默认端口 (ws/h2/REALITY 8443, socks5 10808)
+  1. 使用默认端口 (ws/xhttp/REALITY 8443, socks5 10808)
   2. 随机分配端口 (自动避开占用与本脚本其他节点)
   3. 自定义端口 (1000-65535)
   b. 返回上一级 (取消本次操作)
@@ -115,8 +188,8 @@ bash install.sh reality && bash install.sh ws vless && bash install.sh socks
 
 链接字段与最新版客户端对齐(依据 v2rayN 源码解析逻辑):
 
-- vmess:v2 JSON,`aid=0` 走 AEAD,含 `scy` / `sni` / `fp` 字段;h2 模式 `net=h2`、`port` 为实际端口
-- vless:标准 URI,`encryption=none`,`path` URL 编码,含 `sni` / `fp`;h2 模式 `type=h2`
+- vmess:v2 JSON,`aid=0` 走 AEAD,含 `scy` / `sni` / `fp` 字段;xhttp 模式 `net=xhttp` + `type=auto`(即 xhttp mode)、`alpn=h2`
+- vless:标准 URI,`encryption=none`,`path` URL 编码,含 `sni` / `fp`;xhttp 模式 `type=xhttp&mode=auto&alpn=h2`
 - REALITY:`vless://...?type=tcp&security=reality&pbk=公钥&sid=shortId&sni=伪装域名&fp=chrome&flow=xtls-rprx-vision&encryption=none`
 - socks:`socks://base64(user:pass)@IP:端口#备注`(v2rayN 新格式,明文旧格式也兼容)
 
@@ -125,15 +198,15 @@ bash install.sh reality && bash install.sh ws vless && bash install.sh socks
 | 选项 | 功能 |
 |---|---|
 | 1–2 | 安装 vmess/vless + ws + tls |
-| 3–4 | 安装 vmess/vless + h2 + tls |
+| 3–4 | 安装 vmess/vless + xhttp + tls |
 | 5 | 安装 socks5 |
 | 6 | 安装 vless + REALITY |
 | 7 | 查看全部已安装节点 / 导出全部分享链接 |
-| 8 | 手动续签 / 重新申请证书(ws/h2 共用) |
+| 8 | 手动续签 / 重新申请证书(ws/xhttp 共用) |
 | 9 | 更新 V2Ray / Xray core(全部服务一并重启) |
 | 10 | 更换 REALITY 伪装站(保留 UUID/端口,客户端只改 SNI) |
 | 11 | 重置 REALITY 节点(端口 / UUID / 密钥 / 全部) |
-| 12 | 重置 ws/h2/socks 节点(端口 / UUID / 用户密码) |
+| 12 | 重置 ws/xhttp/socks 节点(端口 / UUID / 用户密码) |
 | 13 | 卸载(单模式或全部) |
 | 14 | 更新脚本(从 GitHub 下载最新版覆盖本地脚本,带合法性/语法校验与回滚) |
 | 15 | 升级已装节点配置(保留 UUID/端口/密钥,按序补跑新版脚本的配置迁移) |
@@ -152,9 +225,9 @@ bash install.sh reality && bash install.sh ws vless && bash install.sh socks
 所有模式的代理出站固定走 **IPv4**(freedom 出站 `domainStrategy: UseIPv4`),
 避免 VPS 的 IPv6 回程质量不稳导致部分站点访问异常。
 
-> **h2 模式的客户端支持**:v2rayNG 全版本可用;**新版 v2rayN(7.10+/26.x 内核架构)
-> 已从传输白名单移除 h2/http,h2 节点链接无法正确导入(会被当作 raw 导致连接失败)**。
-> h2 节点请用 v2rayNG 导入,或改用 ws / REALITY 模式。脚本安装与查看节点时均会提示。
+> **xhttp 模式的客户端支持**:v2rayN 7.1.0+ / v2rayNG 1.9.10+ 可直接导入使用
+> (两者均于 2024-11 加入 xhttp)。更早的客户端不支持 xhttp,且旧的 h2 传输已被
+> Xray 内核删除、同样无法使用,请升级客户端。脚本安装与查看节点时均会提示。
 
 ## 已装机器升级
 
@@ -164,6 +237,10 @@ bash install.sh reality && bash install.sh ws vless && bash install.sh socks
 服务并重建导出链接。CLI 等价命令 `bash install.sh upgrade`。
 1.3.0 起的所有配置级变更(如出站固定 IPv4)都通过该机制向存量机器追平。
 
+**1.5.0 重点**:h2 传输被 Xray 内核删除,该模式迁移到 xhttp。已装 h2 的机器跑菜单 15 后,
+配置从 `config_h2.json` 转到 `config_xhttp.json`、服务从 `v2ray-h2` 换成 `xray-xhttp`
+(UUID/端口/路径全部保留),客户端需重新导入新链接(链接由 `type=http` 变为 `type=xhttp`)。
+
 ## 先装代理后装宝塔
 
 若先用本脚本装了 ws(配置在发行版 nginx),之后才安装宝塔,宝塔 Nginx 不加载
@@ -172,28 +249,29 @@ bash install.sh reality && bash install.sh ws vless && bash install.sh socks
 
 ## 验证过的系统
 
-Debian 11/12/13、Ubuntu 18.04/20.04/22.04/24.04 真机完整测试
-(systemd 237–257、nginx 新旧两种模板格式);CentOS/Rocky/Alma 为代码级支持,
-未做真机验证。
+真机完整测试仅覆盖 **Debian 11/12/13** 与 **Ubuntu 18.04/20.04/22.04/24.04**
+(systemd 237–257、nginx 新旧两种模板格式)。CentOS / Rocky / AlmaLinux 等 RHEL 系
+**为代码级支持,未做真机验证**,详见上文 [支持系统](#支持系统)。
 
 ## 文件位置
 
 | 路径 | 说明 |
 |---|---|
-| `/usr/local/etc/v2ray/config_ws.json` / `config_h2.json` / `config_socks.json` | V2Ray 各模式配置 |
+| `/usr/local/etc/v2ray/config_ws.json` / `config_socks.json` | V2Ray 各模式配置 |
+| `/usr/local/etc/v2ray/config_xhttp.json` | Xray xhttp 配置 |
 | `/usr/local/etc/xray/config_reality.json` | Xray REALITY 配置 |
 | `/usr/local/etc/v2ray/v2ray_info.txt` | 全部节点信息(脚本保存) |
 | `/usr/local/etc/v2ray/used_ports.txt` | 已分配端口记录 |
 | `/root/v2ray_share_url.txt` | 全部分享链接(每次运行菜单 7 重建, 只含当前有效链接) |
 | `/etc/nginx/conf.d/v2ray-ws-tls.conf` | Nginx 站点配置(仅 ws 模式) |
 | `/home/wwwroot/v2ray-web/` | 伪装站点根目录 |
-| `/data/v2ray.crt`、`/data/v2ray.key` | 证书与私钥(ws 与 h2 共用) |
+| `/data/v2ray.crt`、`/data/v2ray.key` | 证书与私钥(ws 与 xhttp 共用) |
 | `/usr/local/bin/ssl_update.sh` | 手动续签脚本(续签后自动重启 nginx + 两个 V2Ray 服务) |
 
 ## 常见问题
 
-- **证书申请失败**:确认域名 A 记录已指向本机、80/443 端口未封禁;然后重试菜单 8。也可把已有证书放到 `/data/v2ray.crt` 和 `/data/v2ray.key` 后重跑脚本。ws 与 h2 共用同一份证书;REALITY 不需要证书。
-- **防火墙**:脚本自动放行 ufw / firewalld 的 80/443 及 h2、socks、REALITY 端口;云厂商安全组需手动放行对应端口。
+- **证书申请失败**:确认域名 A 记录已指向本机、80/443 端口未封禁;然后重试菜单 8。也可把已有证书放到 `/data/v2ray.crt` 和 `/data/v2ray.key` 后重跑脚本。ws 与 xhttp 共用同一份证书;REALITY 不需要证书。
+- **防火墙**:脚本自动放行 ufw / firewalld 的 80/443 及 xhttp、socks、REALITY 端口;云厂商安全组需手动放行对应端口。
 - **socks5 安全**:socks 为明文协议,脚本已随机生成 8 位用户名 + 16 位密码,请勿改成弱密码;仅建议在可信网络使用。
 - **REALITY 连接异常**:通常是伪装目标站不可用或被针对性封锁,可编辑 `/usr/local/etc/xray/config_reality.json` 更换 `dest`/`serverNames` 后 `systemctl restart xray-reality`(同步更新客户端 sni)。
 - **性能**:建议开启 BBR(安装完成提示里有命令)。

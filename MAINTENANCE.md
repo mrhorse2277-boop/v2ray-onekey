@@ -26,10 +26,11 @@
 ## 每轮测试清单
 
 1. `bash -n install.sh` 本地语法检查;有条件时 shellcheck(error 级必须为零)
-2. 安装三模式:reality(443)→ socks → ws(443 被占自动落独立端口)
+2. 安装四模式:reality(443)→ socks → ws(443 被占自动落独立端口)→ xhttp(独立端口)
 3. 验证:REALITY 握手(`openssl s_client -connect 127.0.0.1:443 -servername <sni>`,
    Verify return code: 0)、socks5 连通(curl --proxy socks5h://... 实测 204)、
-   ws 端口(`ss -lnt` IPv4+IPv6 listen 一致)
+   ws 端口(`ss -lnt` IPv4+IPv6 listen 一致)、xhttp 节点用 xray 客户端实测 200
+   (xhttp 只能由 Xray 核心承载,服务端 unit 是 `xray-xhttp`)
 4. `systemctl is-active xray` 应为 **inactive** 且无 `config.json` 占位进程
    (官方 Xray 安装器每次都会复活它,ensure_xray/do_update_v2ray 里负责清)
 5. 菜单 11/12 重置端口:检查 `used_ports.txt` 旧端口删除、新端口写入(f84a6e8 起)
@@ -38,6 +39,54 @@
    `/usr/local/etc/{v2ray,xray}` 目录、`/usr/local/bin/{v2ray,xray}`、
    nginx 配置、监听端口——应全为 0
 7. 换系统回归时,先跑一遍上面全部,再针对该系统差异(包管理/systemd 版本/nginx 版本)看细节
+8. **发行版覆盖现状(必须如实记录)**:
+   - 1.5.0 已实测通过: **Debian 11/12/13 + Ubuntu 18.04/20.04/22.04/24.04**
+   - Debian 12 是 VPS 真机全量回归(四模式/菜单/迁移)
+   - 其余五个版本用 `debootstrap` + `systemd-nspawn` 跑真实发行版用户空间 + 真实
+     systemd,每个都验证了: bash -n / 版本预检 / 组名探测 / OpenSSL 能力 /
+     socks 安装 / 代理连通 200 / 菜单 7 / 卸载清理
+   - **未覆盖**:容器共享宿主内核(内核参数、安全组、磁盘网卡驱动未测);
+     REALITY/ws/xhttp 需域名证书未在容器内跑
+   - 复现方法见本节末尾的 nspawn 命令
+   - CentOS/Rocky/Alma/Fedora/Oracle/RHEL 为**代码级支持,未真机验证**
+   - **CentOS 7 明确不支持**:bash 4.2 无 `local -n`(需 4.3+),systemd 219 无
+     `AmbientCapabilities`(需 229+),`check_system` 会在预检阶段直接拒绝
+   - **OpenSSL 版本坑 (1.5.0 修)**:Ubuntu 18.04 自带 1.1.0g,不支持
+     `s_client -tls1_3`(报 Option unknown)与 `x509 -ext`(报 Unknown digest ext)。
+     修复前 REALITY 选站会把所有候选判失败、直接装不上。现在 `openssl_has_tls13`
+     自动检测并降级到 `-tls1_2` / `-text`,Debian 12 仍走严格路径。
+     实测:18.04 走降级且候选站全 PASS;Debian 11(1.1.1w)/13(3.5)/Ubuntu 20.04+ 走严格路径
+
+## 多发行版测试方法 (systemd-nspawn)
+
+单台 Debian VPS 即可覆盖多个发行版,**不需要重装**:
+
+```bash
+apt-get install -y debootstrap systemd-container
+# 引导真实发行版用户空间 (Debian 系)
+debootstrap --variant=minbase --include=systemd,systemd-sysv,dbus     bullseye /tmp/ns11 http://deb.debian.org/debian/
+# Ubuntu 系 (noble 若报 No such script, 先 cp jammy 脚本改名)
+debootstrap --variant=minbase --include=systemd,systemd-sysv,dbus     bionic /tmp/ns_bionic http://archive.ubuntu.com/ubuntu/
+# 补依赖 + 静态 DNS (systemd-resolved 在容器内常失效)
+printf 'nameserver 8.8.8.8
+' > /tmp/ns11/etc/resolv.conf
+# 启动真实 systemd
+systemd-nspawn -D /tmp/ns11 --machine=t11 --boot --quiet &
+systemd-run --machine=t11 --quiet --pipe --wait /bin/bash -c 'systemctl is-system-running'
+```
+
+**踩过的坑**:
+- 容器内 `/tmp` 是 53MB tmpfs,官方 core 安装脚本解压 18MB 包会 disk full;
+  跑安装前 `export TMPDIR=/root/tmpwork`(磁盘目录)
+- chroot 模式(非 nspawn)必须先 `mount --bind /dev`,否则 `source <(...)` 报
+  `/dev/fd/63: No such file or directory`;但 bind 了 /dev 又会挡住 nspawn 启动,
+  两者只能选一
+- `machinectl shell` 会吞输出,用 `systemd-run --machine=X --pipe --wait` 拿结果
+- Ubuntu 容器内 systemd-resolved 常起不来,直接 disable 并写静态 resolv.conf
+   - `check_system` 对 RHEL 系打印醒目警告,交互模式经 `confirm_untested_distro`
+     要求确认(非交互不阻塞,否则一键命令会卡住)
+   - **纪律**:写文档时区分"本轮实测"与"历史记录",不要把没跑过的版本标成已验证;
+     真在某版本跑通了再升 ✅,并同步 README 表格 + install.sh 头部注释 + 本节
 
 ## 已知版本敏感点(改代码前先看)
 
@@ -57,6 +106,13 @@
 
 - **模式隔离**:四模式各自独立配置文件+systemd 服务,任意组合共存;
   端口冲突在分配时解决(REALITY 占 443 → ws 落独立端口;nginx 占 443 → REALITY 落独立端口)
+- **xhttp 模式用 Xray 核心**:v2fly 不支持 xhttp 传输(实测 `unknown transport protocol: xhttp`),
+  所以该模式的 unit 是 `xray-xhttp` + `/usr/local/bin/xray`,配置文件在
+  `/usr/local/share/xray/` 找 geo 数据(`ensure_xray_geo_data` 兜底下载;
+  注意 Xray-rules-dat 的资产名是 `geoip-full.dat`,没有 `geoip.dat`)
+- **h2 已从 Xray 删除**(v24.12.31 起,`Transport: Remove HTTP`):任何 `"network": "h2"`
+  配置在 Xray 上直接报 `The feature HTTP transport ... has been removed`;
+  v2fly 仍支持 h2 但客户端全部失效。旧 h2 机器靠迁移 `migr_h2_to_xhttp` 转换
 - **core 安装**:不自己下载二进制,调 v2fly/fhs-install-v2ray 与 XTLS/Xray-install 的
   install-release.sh,脚本不硬编码版本号,长期不更新也能装到最新 core。
   ensure_v2ray/ensure_xray 只判断"有没有",升级走菜单 9(无条件重跑安装脚本+重启服务)
@@ -84,13 +140,30 @@
 - **配置迁移机制(菜单 15)**:改任何配置模板必须同步在 `MIGRATIONS` 数组追加
   `"版本|函数|描述"` 并实现幂等迁移函数(先检测字段已存在则跳过),存量机器跑一次
   菜单 15 就追平;已应用记录在 `MIGRATIONS_STATE`
-  (`/usr/local/etc/v2ray/migrations_done.txt`,格式 `版本|函数名`),失败自动回滚不记 state
+  (`/usr/local/etc/v2ray/migrations_done.txt`,格式 `版本|函数名`),失败自动回滚不记 state。
+  **注意跨文件迁移的特殊性**:执行器默认要求目标配置已存在(否则 continue),
+  但 h2→xhttp 的源是 `config_h2.json`、目标是尚不存在的 `config_xhttp.json`,
+  所以执行器对 `migr_h2_to_xhttp` 特判放行源文件,且目标不存在时不备份(回滚靠删新文件)。
+  迁移函数内部还要自己判 `[[ "${conf}" == "${XHTTP_CONF}" ]]`,否则会被执行器
+  对四种配置各调一次、把 h2 配置写到别的模式上
 - **推送前完整可用性测试**:每次维护/更新脚本,推送前必须在测试 VPS 上实测
   服务 active + REALITY 握手 Verify=0 + socks5 curl 204 + 菜单 7 链接生成
-  (AGENTS.md 门禁硬规则,静态检查不算测过)
-- **降权与权限**:服务以 nobody 运行,配置文件必须 `root:nogroup 640`
+  (AGENTS.md 门禁硬规则,静态检查不算测过)。
+  **xhttp 实测方法**:Xray 26.x 删了 `allowInsecure`,客户端配置要用
+  `pinnedPeerCertSha256`(证书 DER 的 sha256 **hex** 字符串,不是 base64),
+  否则连测试都跑不起来
+- **降权与权限**:服务以 nobody 运行,配置文件必须 `root:<组> 640`
   (`fix_config_perm`);任何 sed -i 改配置的路径之后都要补一次属组修正,
-  否则服务读不到配置起不来
+  否则服务读不到配置起不来。
+  **组名跨发行版不同**:Debian/Ubuntu 是 `nogroup`,RHEL/CentOS/Rocky/Alma/Fedora
+  是 `nobody`(没有 nogroup)。systemd 的 `Group=` 指向不存在的组会让服务**直接启动失败**
+  (实测 `Failed with result 'exit-code'`),所以四个 unit 模板都不能硬编码,
+  统一用 `detect_nobody_group` 探测(`NOBODY_GROUP`,优先 nogroup→nobody→root 兜底)
+- **busybox sed**:替换串里的 `
+` 在 busybox sed(Alpine 等精简系统)上会写成字面
+  `
+` 而不是换行。需要多行插入时用 awk `print` 而不是 sed,awk 在各实现上一致
+  (`migr_h2_to_xhttp` 补 xhttpSettings 就是这样改的)
 
 ## 本地资料库 (docs/kb + docs/upstream, 仅本地)
 
@@ -104,7 +177,7 @@
 
 ```bash
 # 服务与端口
-systemctl is-active v2ray-ws v2ray-socks xray-reality; ss -lnt
+systemctl is-active v2ray-ws v2ray-socks xray-reality xray-xhttp; ss -lnt
 # 占位进程检查 (官方安装器残留)
 pgrep -af 'xray run -config /usr/local/etc/xray/config.json'
 # REALITY 握手

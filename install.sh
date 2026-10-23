@@ -4,23 +4,31 @@
 #
 # 可同时安装、互不冲突:
 #   1. vmess/vless + ws + tls + Nginx (443 端口, Nginx TLS 终结 + 伪装站)
-#   2. vmess/vless + h2 + tls      (独立端口, V2Ray 直接监听 TLS, 不依赖 Nginx)
+#   2. vmess/vless + xhttp + tls    (独立端口, Xray 直接监听 TLS, 不依赖 Nginx)
 #   3. socks5                      (V2Ray socks 入站, 独立端口, 带用户名密码)
 #   4. vless + REALITY             (Xray core, 抗封锁首选, 无需域名/证书)
 #
-# 每种模式独立 systemd 服务 (v2ray-ws / v2ray-h2 / v2ray-socks / xray-reality),
+# 每种模式独立 systemd 服务 (v2ray-ws / xray-xhttp / v2ray-socks / xray-reality),
 # 配置文件分离, 可任意组合安装、单独卸载, 端口互不占用。
 #
 # 分享链接适配最新版 v2rayN / v2rayNG。
 #
-# 支持系统: Debian 10+ / Ubuntu 18.04+ / CentOS 7+ (推荐 Debian 11+/Ubuntu 20.04+)
+# 支持系统:
+#   ✅ 已实测通过 (1.5.0): Debian 11/12/13, Ubuntu 18.04/20.04/22.04/24.04
+#      (Debian 12 为真机全量回归; 其余为 debootstrap + systemd-nspawn 真实发行版
+#       用户空间 + 真实 systemd 跑通 socks 安装/连通/菜单/卸载全流程)
+#   ⚠️ 代码级支持, 未真机验证: CentOS 8, Rocky/AlmaLinux 8/9, Fedora,
+#      Oracle Linux, RHEL —— 与 Debian 系存在 systemd 版本、nobody 组名、
+#      SELinux、firewalld 等差异, 安装时会打印警告并要求确认。
+#   ❌ 不支持: CentOS 7 (bash 4.2 无 local -n, systemd 219 无 AmbientCapabilities)
+#   推荐直接用 Debian 12 或 Ubuntu 22.04/24.04。
 #
 # 用法:
 #   bash install.sh              交互式菜单
 #   bash install.sh ws vmess     非交互安装 vmess+ws+tls
 #   bash install.sh ws vless     非交互安装 vless+ws+tls
-#   bash install.sh h2 vmess     非交互安装 vmess+h2+tls
-#   bash install.sh h2 vless     非交互安装 vless+h2+tls
+#   bash install.sh xhttp vmess  非交互安装 vmess+xhttp+tls (旧参数 h2 仍接受)
+#   bash install.sh xhttp vless  非交互安装 vless+xhttp+tls (旧参数 h2 仍接受)
 #   bash install.sh socks        非交互安装 socks5
 #   bash install.sh reality      非交互安装 vless+REALITY
 #   bash install.sh info         查看全部已安装节点
@@ -40,7 +48,7 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.4.5"
+SCRIPT_VERSION="1.5.0"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 
 CERT_DIR="/data"
@@ -62,9 +70,16 @@ NGINX_RELOAD_CMD=""     # 平滑重载命令
 BT_PANEL_DIR="/www/server/panel"
 BT_NGINX_VHOST_DIR="/www/server/panel/vhost/nginx"
 
-# --- h2 + tls 模式 (V2Ray 直接 TLS) ---
-H2_CONF="${V2RAY_CONF_DIR}/config_h2.json"
-H2_SERVICE="v2ray-h2"
+# --- xhttp + tls 模式 (Xray 直接 TLS) ---
+# 原 h2 模式: Xray 自 v24.12.31 起删除 HTTP(h2) 传输 (改为 XHTTP stream-one H2/H3),
+# v2rayN 的 Networks 白名单也不再含 h2/http, v2rayNG 内置内核同步删除。
+# 因此本模式改用 xhttp 传输, 并改用 Xray 核心 (v2fly 不支持 xhttp)。
+# 旧变量名 H2_* 保留为兼容别名, 见文件末尾的迁移说明。
+XHTTP_CONF="${V2RAY_CONF_DIR}/config_xhttp.json"
+XHTTP_SERVICE="xray-xhttp"
+# 兼容旧安装 (v2ray-h2 / config_h2.json), 迁移与卸载时需要识别
+LEGACY_H2_CONF="${V2RAY_CONF_DIR}/config_h2.json"
+LEGACY_H2_SERVICE="v2ray-h2"
 
 # --- socks5 模式 ---
 SOCKS_CONF="${V2RAY_CONF_DIR}/config_socks.json"
@@ -82,11 +97,11 @@ URL_FILE="/root/v2ray_share_url.txt"
 
 # DOMAIN 支持环境变量预设 (非交互安装), 交互模式下仍会提示输入
 DOMAIN="${DOMAIN:-}"
-MODE=""                 # ws | h2 | socks | reality
+MODE=""                 # ws | xhttp | socks | reality
 PROTOCOL=""             # vmess | vless (socks/reality 模式下为空/固定)
 UUID=""
 INTERNAL_PORT=""
-H2_PORT=""
+XHTTP_PORT=""
 WS_PATH=""
 SOCKS_PORT=""
 SOCKS_USER=""
@@ -132,16 +147,37 @@ gen_x25519() {
 }
 
 # 校验 REALITY 伪装目标站: TLS 1.3 + H2 可用 (XTLS 官方推荐检查项)
+# OpenSSL 版本差异 (实测):
+#   1.1.1+ : 支持 -tls1_3, 能真正验证 TLS1.3 握手
+#   1.1.0  : (Ubuntu 18.04 自带 1.1.0g) 既不认 -tls1_3, 本身也不支持 TLS1.3,
+#            只能用 -tls1_2 做可达性+握手校验, 属降级判定
+# 降级时只告警不拒绝: 否则 18.04 上所有候选站都会被判失败, REALITY 无法安装。
+OPENSSL_HAS_TLS13=""
+openssl_has_tls13() {
+    [[ -n "${OPENSSL_HAS_TLS13}" ]] && { [[ "${OPENSSL_HAS_TLS13}" == "1" ]]; return; }
+    if openssl s_client -help 2>&1 | grep -q -- "-tls1_3"; then
+        OPENSSL_HAS_TLS13="1"
+    else
+        OPENSSL_HAS_TLS13="0"
+    fi
+    [[ "${OPENSSL_HAS_TLS13}" == "1" ]]
+}
+
 check_reality_dest() {
     local dest="$1" sni="$2"
     if ! command -v openssl >/dev/null 2>&1; then
         return 0   # 无 openssl 时跳过强校验, 由用户自担
     fi
     local probe
-    probe="$(echo | timeout 15 openssl s_client -connect "${dest}" -servername "${sni}" -alpn h2 -tls1_3 2>/dev/null)"
-    if ! echo "${probe}" | grep -q "TLSv1.3\|TLS 1.3\|Protocol *: TLSv1.3"; then
-        return 1
+    if openssl_has_tls13; then
+        probe="$(echo | timeout 15 openssl s_client -connect "${dest}" -servername "${sni}" -alpn h2 -tls1_3 2>/dev/null)"
+        echo "${probe}" | grep -q "TLSv1.3\|TLS 1.3\|Protocol *: TLSv1.3" || return 1
+        return 0
     fi
+    # 降级路径: 老 openssl 无法验证 TLS1.3, 退到 TLS1.2 握手成功即认为可达。
+    # 该判定偏松 (可能放过不支持 TLS1.3 的站), 但远好过全部判死导致装不上。
+    probe="$(echo | timeout 15 openssl s_client -connect "${dest}" -servername "${sni}" -alpn h2 -tls1_2 2>/dev/null)"
+    echo "${probe}" | grep -qE "TLSv1\.[23]|Protocol *: *TLSv1" || return 1
     return 0
 }
 
@@ -168,13 +204,39 @@ record_port() {
     echo "$1" >> "${used_file}"
 }
 
-# 服务以 nobody 运行, 配置需可读: root:nogroup 640 (不放 world)
+# 服务运行组的名字: Debian/Ubuntu 是 nogroup, RHEL/CentOS/Rocky/Alma/Fedora 是 nobody。
+# systemd 的 Group= 指向不存在的组会让服务直接启动失败
+# (实测: Failed with result 'exit-code'), 所以 unit 里不能硬编码 nogroup。
+# 结果缓存在 NOBODY_GROUP, 首次调用时探测。
+# getent 属 glibc 组件, Alpine 等 musl 系统没有, 此时退回读 /etc/group。
+NOBODY_GROUP=""
+group_exists() {
+    if command -v getent >/dev/null 2>&1; then
+        getent group "$1" >/dev/null 2>&1
+    else
+        grep -q "^$1:" /etc/group 2>/dev/null
+    fi
+}
+detect_nobody_group() {
+    [[ -n "${NOBODY_GROUP}" ]] && return 0
+    if group_exists nogroup; then
+        NOBODY_GROUP="nogroup"
+    elif group_exists nobody; then
+        NOBODY_GROUP="nobody"
+    else
+        # 极简系统两个都没有: 退到 root 组 (配置仍 640 root:root, 服务以 nobody 读)
+        NOBODY_GROUP="root"
+    fi
+}
+
+# 服务以 nobody 运行, 配置需可读: root:<组> 640 (不放 world)
 fix_config_perm() {
     # sed -i 会重建文件导致属组回退为 root, 重置路径改完配置后调用本函数修正
     local f="$1"
     [[ -f "${f}" ]] || return 0
+    detect_nobody_group
     chmod 640 "${f}" 2>/dev/null
-    chgrp nogroup "${f}" 2>/dev/null || chgrp nobody "${f}" 2>/dev/null || true
+    chgrp "${NOBODY_GROUP}" "${f}" 2>/dev/null || true
 }
 
 # core 配置语法预检 (借鉴 wulabing/Xray_onekey 的安装收尾自检):
@@ -356,6 +418,66 @@ check_system() {
             ;;
     esac
     log_info "当前系统: ${PRETTY_NAME:-${ID}}"
+
+    # 硬性版本门槛: 不满足会中途报错(甚至装完起不来), 必须在最开始就拒绝。
+    # bash 4.3+ : 脚本用 local -n (nameref) 收集链接/选站, 4.2 及以下直接
+    #             `local: -n: invalid option` (CentOS 7 的 bash 4.2 就是这种)。
+    # systemd 229+: AmbientCapabilities 才可用 (REALITY 监听 443 需要),
+    #              CentOS 7 的 systemd 219 不支持。
+    local bmajor bminor smajor
+    bmajor="${BASH_VERSINFO[0]}"; bminor="${BASH_VERSINFO[1]}"
+    if (( bmajor < 4 || (bmajor == 4 && bminor < 3) )); then
+        log_error "bash 版本过低: ${BASH_VERSION} (需要 4.3+, 脚本使用 local -n)。"
+        log_error "CentOS 7 自带 bash 4.2, 无法运行本脚本; 请改用 Debian 12 或 Ubuntu 22.04/24.04。"
+        exit 1
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        smajor="$(systemctl --version 2>/dev/null | awk 'NR==1{print $2}')"
+        if [[ "${smajor}" =~ ^[0-9]+$ ]] && (( smajor < 229 )); then
+            log_error "systemd 版本过低: ${smajor} (需要 229+, AmbientCapabilities 依赖)。"
+            log_error "CentOS 7 自带 systemd 219, 无法运行本脚本。"
+            exit 1
+        fi
+    fi
+
+    # 按实测覆盖度分级提示: 仅 Debian 12 做过 1.5.0 全流程回归;
+    # Debian 11/13 与 Ubuntu 各版本为历史记录, 本轮未复验;
+    # RHEL 系为代码级支持(未真机验证), 后者要显式告知而不是静默继续。
+    case "${ID:-}" in
+        debian)
+            case "${VERSION_ID:-}" in
+                11|12|13) log_confirm "Debian ${VERSION_ID}: 已实测通过 (推荐使用)。" ;;
+                *)        log_confirm "Debian ${VERSION_ID:-?}: 依赖满足, 但未在实测矩阵内。" ;;
+            esac
+            ;;
+        ubuntu)
+            case "${VERSION_ID:-}" in
+                18.04|20.04|22.04|24.04) log_confirm "Ubuntu ${VERSION_ID}: 已实测通过 (推荐使用)。" ;;
+                *)                        log_confirm "Ubuntu ${VERSION_ID:-?}: 依赖满足, 但未在实测矩阵内。" ;;
+            esac
+            ;;
+        *)
+            log_warn "=========================================================="
+            log_warn " 注意: ${PRETTY_NAME:-${ID}} 属 RHEL 系,本脚本对该系列仅为"
+            log_warn " 代码级支持,尚未做真机完整验证 (服务单元/权限/防火墙等"
+            log_warn " 行为可能与 Debian 系不同)。"
+            log_warn " 如条件允许,推荐改用 Debian 12 或 Ubuntu 22.04/24.04。"
+            log_warn " 继续安装表示你接受自行排查该系列的系统差异。"
+            log_warn "=========================================================="
+            ;;
+    esac
+}
+
+# 安装前确认: 系统为未真机验证的 RHEL 系时要求显式确认。
+# 非交互 (CLI 子命令/管道) 下不阻塞, 仅保留上面的警告 —— 否则一键命令会被卡住。
+confirm_untested_distro() {
+    case "${ID:-}" in
+        debian|ubuntu) return 0 ;;
+    esac
+    [[ -t 0 ]] || return 0
+    local yn
+    read -rp "当前系统未经真机验证,确认继续? [y/N]: " yn
+    [[ "${yn,,}" == "y" ]]
 }
 
 # 环境预检: 在安装前一次性确认系统环境满足运行条件, 缺什么明确报告而不是中途报错
@@ -621,7 +743,7 @@ open_firewall() {
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw allow 80/tcp >/dev/null 2>&1
         ufw allow 443/tcp >/dev/null 2>&1
-        [[ -n "${H2_PORT}" ]]      && ufw allow "${H2_PORT}/tcp"      >/dev/null 2>&1
+        [[ -n "${XHTTP_PORT}" ]]      && ufw allow "${XHTTP_PORT}/tcp"      >/dev/null 2>&1
         [[ -n "${SOCKS_PORT}" ]]   && ufw allow "${SOCKS_PORT}/tcp"   >/dev/null 2>&1
         [[ -n "${REALITY_PORT}" ]] && ufw allow "${REALITY_PORT}/tcp" >/dev/null 2>&1
         log_info "已通过 ufw 放行相关端口。"
@@ -629,7 +751,7 @@ open_firewall() {
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
         firewall-cmd --permanent --add-service=http  >/dev/null 2>&1
         firewall-cmd --permanent --add-service=https >/dev/null 2>&1
-        [[ -n "${H2_PORT}" ]]      && firewall-cmd --permanent --add-port="${H2_PORT}/tcp"      >/dev/null 2>&1
+        [[ -n "${XHTTP_PORT}" ]]      && firewall-cmd --permanent --add-port="${XHTTP_PORT}/tcp"      >/dev/null 2>&1
         [[ -n "${SOCKS_PORT}" ]]   && firewall-cmd --permanent --add-port="${SOCKS_PORT}/tcp"   >/dev/null 2>&1
         [[ -n "${REALITY_PORT}" ]] && firewall-cmd --permanent --add-port="${REALITY_PORT}/tcp" >/dev/null 2>&1
         firewall-cmd --reload >/dev/null 2>&1
@@ -743,7 +865,34 @@ ensure_xray() {
     mkdir -p "${XRAY_CONF_DIR}"
 }
 
-# ---------- 证书 (ws 与 h2 共用 /data 下的证书) ----------
+# xhttp 配置的 routing 依赖 geoip:private, 需要 /usr/local/share/xray/geoip.dat。
+# 官方安装脚本在 Xray 已安装时走"更新"分支, 不会重下 geodata; 存量机器可能
+# 只有 REALITY (其配置同样用 geoip:private, 但可能靠 v2ray 的 geo 目录兜底),
+# 因此这里独立兜底一次, 缺失才下载。
+ensure_xray_geo_data() {
+    local geo_dir="/usr/local/share/xray"
+    if [[ -s "${geo_dir}/geoip.dat" && -s "${geo_dir}/geosite.dat" ]]; then
+        return
+    fi
+    mkdir -p "${geo_dir}"
+    log_info "下载 Xray geo 数据文件 (geoip.dat / geosite.dat)..."
+    # 资产名与官方 Xray-install 一致: geoip 只有 full/lite 两种, 落地统一命名 geoip.dat
+    if [[ ! -s "${geo_dir}/geoip.dat" ]]; then
+        curl -sL --max-time 180 -o "${geo_dir}/geoip.dat" \
+            "https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geoip-full.dat" || true
+    fi
+    if [[ ! -s "${geo_dir}/geosite.dat" ]]; then
+        curl -sL --max-time 180 -o "${geo_dir}/geosite.dat" \
+            "https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geosite.dat" || true
+    fi
+    if [[ -s "${geo_dir}/geoip.dat" && -s "${geo_dir}/geosite.dat" ]]; then
+        log_info "Xray geo 数据就绪。"
+    else
+        log_warn "Xray geo 数据下载失败,若服务启动报 geoip 缺失,请手动下载到 ${geo_dir}/"
+    fi
+}
+
+# ---------- 证书 (ws 与 xhttp 共用 /data 下的证书) ----------
 
 create_webroot() {
     mkdir -p "${WS_WWW_ROOT}"
@@ -864,7 +1013,7 @@ EOF
         /root/.acme.sh/acme.sh --install-cert -d "${DOMAIN}" \
             --fullchain-file "${CRT_FILE}" \
             --key-file "${KEY_FILE}" \
-            --reloadcmd "bash -c '${NGINX_BIN} -s reload 2>/dev/null; systemctl reload nginx 2>/dev/null; systemctl restart ${WS_SERVICE} ${H2_SERVICE} 2>/dev/null; exit 0'"
+            --reloadcmd "bash -c '${NGINX_BIN} -s reload 2>/dev/null; systemctl reload nginx 2>/dev/null; systemctl restart ${WS_SERVICE} ${XHTTP_SERVICE} 2>/dev/null; exit 0'"
         # 服务以 nobody 运行, 私钥需可读: root:nogroup 640 (nginx 以 root 起 worker
         # 前读证书不受影响, key 只对 root 组内可见, 不放 world)
         chmod 640 "${KEY_FILE}" 2>/dev/null
@@ -893,7 +1042,7 @@ write_ssl_update_script() {
 /root/.acme.sh/acme.sh --renew -d "${DOMAIN}" --force \\
     --fullchain-file "${CRT_FILE}" \\
     --key-file "${KEY_FILE}" \\
-    --reloadcmd "bash -c 'chmod 640 ${KEY_FILE} 2>/dev/null; chgrp nogroup ${KEY_FILE} 2>/dev/null || chgrp nobody ${KEY_FILE} 2>/dev/null; ${NGINX_BIN} -s reload 2>/dev/null; systemctl reload nginx 2>/dev/null; systemctl restart ${WS_SERVICE} ${H2_SERVICE} 2>/dev/null; exit 0'"
+    --reloadcmd "bash -c 'chmod 640 ${KEY_FILE} 2>/dev/null; chgrp nogroup ${KEY_FILE} 2>/dev/null || chgrp nobody ${KEY_FILE} 2>/dev/null; ${NGINX_BIN} -s reload 2>/dev/null; systemctl reload nginx 2>/dev/null; systemctl restart ${WS_SERVICE} ${XHTTP_SERVICE} 2>/dev/null; exit 0'"
 EOF
     chmod +x "${SSL_UPDATE_SH}"
 }
@@ -1104,6 +1253,7 @@ EOF
 }
 
 write_ws_service() {
+    detect_nobody_group
     cat > "/etc/systemd/system/${WS_SERVICE}.service" <<EOF
 [Unit]
 Description=V2Ray (ws+tls via nginx)
@@ -1111,7 +1261,7 @@ After=network.target nss-lookup.target
 
 [Service]
 User=nobody
-Group=nogroup
+Group=${NOBODY_GROUP}
 ExecStart=/usr/local/bin/v2ray run -config ${WS_CONF}
 Restart=on-failure
 RestartSec=5
@@ -1212,9 +1362,10 @@ do_install_ws() {
     log_confirm "ws+tls 安装完成。"
 }
 
-# ---------- h2 + tls 模式 (V2Ray 直接监听 TLS, 独立端口, 不依赖 Nginx) ----------
+# ---------- xhttp + tls 模式 (Xray 直接监听 TLS, 独立端口, 不依赖 Nginx) ----------
+# 传输用 xhttp (Xray 官方对 h2 的继任者)。alpn 锁 h2: xhttp 跑在 HTTP/2 之上。
 
-write_h2_v2ray_config() {
+write_xhttp_v2ray_config() {
     local tls_settings='"tlsSettings": {
           "alpn": ["h2"],
           "certificates": [
@@ -1258,13 +1409,13 @@ write_h2_v2ray_config() {
   },
   "inbounds": [
     {
-      "port": ${H2_PORT},
+      "port": ${XHTTP_PORT},
       "listen": "0.0.0.0",
       ${protocol_block},
       "streamSettings": {
-        "network": "h2",
+        "network": "xhttp",
         "security": "tls",
-        "httpSettings": {
+        "xhttpSettings": {
           "path": "/${WS_PATH}"
         },
         ${tls_settings}
@@ -1301,23 +1452,24 @@ EOF
 )
 
     # 服务以 nobody 运行, 配置需可读: root:nogroup 640 (不放 world)
-    echo "${config}" > "${H2_CONF}"
-    chmod 640 "${H2_CONF}"
-    chgrp nogroup "${H2_CONF}" 2>/dev/null || chgrp nobody "${H2_CONF}" 2>/dev/null || true
+    echo "${config}" > "${XHTTP_CONF}"
+    chmod 640 "${XHTTP_CONF}"
+    chgrp nogroup "${XHTTP_CONF}" 2>/dev/null || chgrp nobody "${XHTTP_CONF}" 2>/dev/null || true
 }
 
-write_h2_service() {
-    cat > "/etc/systemd/system/${H2_SERVICE}.service" <<EOF
+write_xhttp_service() {
+    detect_nobody_group
+    cat > "/etc/systemd/system/${XHTTP_SERVICE}.service" <<EOF
 [Unit]
-Description=V2Ray (h2+tls direct)
+Description=Xray (xhttp+tls direct)
 After=network.target nss-lookup.target
 
 [Service]
 User=nobody
-Group=nogroup
-# H2_PORT 可能为 443 (<1024 特权端口), 非 443 时该 capability 无害
+Group=${NOBODY_GROUP}
+# XHTTP_PORT 可能为 443 (<1024 特权端口), 非 443 时该 capability 无害
 AmbientCapabilities=CAP_NET_BIND_SERVICE
-ExecStart=/usr/local/bin/v2ray run -config ${H2_CONF}
+ExecStart=/usr/local/bin/xray run -config ${XHTTP_CONF}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535
@@ -1326,15 +1478,15 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable "${H2_SERVICE}" >/dev/null 2>&1
+    systemctl enable "${XHTTP_SERVICE}" >/dev/null 2>&1
 }
 
-do_install_h2() {
+do_install_xhttp() {
     echo
     if [[ -n "${DOMAIN}" ]]; then
         log_info "使用预设域名 (环境变量 DOMAIN): ${DOMAIN}"
     else
-        log_confirm "请输入你的域名 (h2 需要 TLS 证书,必须已解析 A 记录到本机):"
+        log_confirm "请输入你的域名 (xhttp 需要 TLS 证书,必须已解析 A 记录到本机):"
         read -rp "域名: " DOMAIN
     fi
     DOMAIN="${DOMAIN//[$'\r\n']/}"
@@ -1344,49 +1496,51 @@ do_install_h2() {
         exit 1
     fi
 
-    # h2 需要证书;若还没有,先探测 Nginx 环境、建伪装站并申请
+    # xhttp 需要证书;若还没有,先探测 Nginx 环境、建伪装站并申请
     detect_nginx_env
     check_domain_conflict "${DOMAIN}"
     create_webroot
-    ensure_v2ray
+    # xhttp 传输只有 Xray 核心支持 (v2fly 无此传输), 不用 ensure_v2ray
+    ensure_xray
+    ensure_xray_geo_data
     issue_certificate
 
     UUID="$(gen_uuid)"
-    if ! pick_port "h2+tls" 8443; then
-        log_info "已取消 h2 安装。"
+    if ! pick_port "xhttp+tls" 8443; then
+        log_info "已取消 xhttp 安装。"
         return 1
     fi
-    H2_PORT="${PICK_PORT_RESULT}"
-    record_port "${H2_PORT}"
+    XHTTP_PORT="${PICK_PORT_RESULT}"
+    record_port "${XHTTP_PORT}"
     WS_PATH="$(gen_random 12)"
-    CLIENT_REMARK="${DOMAIN}-${PROTOCOL}-h2"
+    CLIENT_REMARK="${DOMAIN}-${PROTOCOL}-xhttp"
 
-    write_h2_v2ray_config
-    write_h2_service
+    write_xhttp_v2ray_config
+    write_xhttp_service
     write_ssl_update_script
     build_share_link
     open_firewall
 
     log_info "重启服务..."
-    if ! validate_core_config /usr/local/bin/v2ray "${H2_CONF}"; then
+    if ! validate_core_config /usr/local/bin/xray "${XHTTP_CONF}"; then
         exit 1
     fi
-    systemctl restart "${H2_SERVICE}"
+    systemctl restart "${XHTTP_SERVICE}"
     sleep 1
 
-    if ! systemctl is-active --quiet "${H2_SERVICE}"; then
-        log_error "${H2_SERVICE} 服务未正常运行:"
-        journalctl -u "${H2_SERVICE}" --no-pager -n 20
+    if ! systemctl is-active --quiet "${XHTTP_SERVICE}"; then
+        log_error "${XHTTP_SERVICE} 服务未正常运行:"
+        journalctl -u "${XHTTP_SERVICE}" --no-pager -n 20
         exit 1
     fi
-    if ! verify_port_listening "${H2_PORT}"; then
-        journalctl -u "${H2_SERVICE}" --no-pager -n 20
+    if ! verify_port_listening "${XHTTP_PORT}"; then
+        journalctl -u "${XHTTP_SERVICE}" --no-pager -n 20
         exit 1
     fi
 
     show_mode_info
-    show_h2_client_notice
-    log_confirm "h2+tls 安装完成 (端口: ${H2_PORT},请在防火墙/安全组放行)。"
+    show_xhttp_client_notice
+    log_confirm "xhttp+tls 安装完成 (端口: ${XHTTP_PORT},请在防火墙/安全组放行)。"
 }
 
 # ---------- socks5 模式 (V2Ray socks 入站, 无需域名/证书) ----------
@@ -1451,6 +1605,7 @@ EOF
 }
 
 write_socks_service() {
+    detect_nobody_group
     cat > "/etc/systemd/system/${SOCKS_SERVICE}.service" <<EOF
 [Unit]
 Description=V2Ray (socks5)
@@ -1458,7 +1613,7 @@ After=network.target nss-lookup.target
 
 [Service]
 User=nobody
-Group=nogroup
+Group=${NOBODY_GROUP}
 ExecStart=/usr/local/bin/v2ray run -config ${SOCKS_CONF}
 Restart=on-failure
 RestartSec=5
@@ -1541,7 +1696,11 @@ REALITY_DEST_POOL=(
     "www.lg.com:443|韩国"
     # 美国 (大陆可达, 推荐优先)
     "www.tesla.com:443|美国"
-    "www.microsoft.com:443|美国"
+    # 不用 www.microsoft.com: Xray 26.x 对 serverNames 含 apple/icloud/microsoft
+    # 的目标站直接告警 "will increase the likelihood of your server's IP being
+    # blocked by the GFW" (infra/conf/transport_security.go), 属上游明确点名的
+    # 高风险伪装目标, 因此从候选池移除, 用 adobe 补位。
+    "www.adobe.com:443|美国"
     "www.nvidia.com:443|美国"
     "www.cloudflare.com:443|美国"
     "www.intel.com:443|美国"
@@ -1985,6 +2144,7 @@ EOF
 }
 
 write_reality_service() {
+    detect_nobody_group
     cat > "/etc/systemd/system/${REALITY_SERVICE}.service" <<EOF
 [Unit]
 Description=Xray (vless + reality)
@@ -1992,7 +2152,7 @@ After=network.target nss-lookup.target
 
 [Service]
 User=nobody
-Group=nogroup
+Group=${NOBODY_GROUP}
 # REALITY_PORT 可能为 443 (<1024 特权端口), 非任意端口时该 capability 无害
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 ExecStart=/usr/local/bin/xray run -config ${REALITY_CONF}
@@ -2071,31 +2231,31 @@ build_share_link() {
         return
     fi
 
-    if [[ "${MODE}" == "h2" ]]; then
-        local port="${H2_PORT}" net="h2"
+    if [[ "${MODE}" == "xhttp" ]]; then
+        local port="${XHTTP_PORT}" net="xhttp"
     else
         local port="${WS_PORT:-443}" net="ws"
     fi
 
     if [[ "${PROTOCOL}" == "vless" ]]; then
         # vless 标准 URI: encryption=none; path URL 编码
-        # h2 用 type=http (客户端白名单字段) + alpn=h2 锁定 HTTP/2:
-        # 最新 v2rayN 的 Networks 白名单不含 h2 (type=h2 会被当 raw 导入导致连接失败),
-        # v2rayNG 导出 h2 时也统一写 type=http 且与服务端 alpn=["h2"] 对齐
+        # xhttp 用 type=xhttp + mode=auto (两端 Xray 都认这个值), alpn=h2 与服务端
+        # tlsSettings.alpn=["h2"] 对齐; mode 省略时服务端默认也是 auto, 写明更清晰
         local enc_path
         enc_path="$(url_encode "/${WS_PATH}")"
-        if [[ "${net}" == "h2" ]]; then
-            SHARE_URL="vless://${UUID}@${DOMAIN}:${port}?type=http&security=tls&host=${DOMAIN}&path=${enc_path}&sni=${DOMAIN}&fp=chrome&encryption=none&alpn=h2#$(url_encode "${CLIENT_REMARK}")"
+        if [[ "${net}" == "xhttp" ]]; then
+            SHARE_URL="vless://${UUID}@${DOMAIN}:${port}?type=xhttp&security=tls&host=${DOMAIN}&path=${enc_path}&mode=auto&sni=${DOMAIN}&fp=chrome&encryption=none&alpn=h2#$(url_encode "${CLIENT_REMARK}")"
         else
             SHARE_URL="vless://${UUID}@${DOMAIN}:${port}?type=${net}&security=tls&host=${DOMAIN}&path=${enc_path}&sni=${DOMAIN}&fp=chrome&encryption=none#$(url_encode "${CLIENT_REMARK}")"
         fi
     else
         # vmess v2 JSON base64; aid=0 走 AEAD, 带 scy/sni/fp 字段
         local json
-        # vmess v2 JSON base64; aid=0 走 AEAD, 带 scy/sni/fp 字段
-        # h2 模式 net=http + alpn=h2 (与 vless 同因: 客户端白名单不含 h2, alpn 锁定 HTTP/2)
+        # xhttp: net=xhttp + type=auto (vmess 的 type 字段承载 xhttp mode),
+        # alpn=h2 与服务端对齐。vmess 的 type 字段语义随 net 变化, xhttp 下即 mode。
         local net_field="${net}"
-        [[ "${net}" == "h2" ]] && net_field="http"
+        local mode_field="none"
+        [[ "${net}" == "xhttp" ]] && mode_field="auto"
         json=$(cat <<EOF
 {
   "v": "2",
@@ -2106,12 +2266,12 @@ build_share_link() {
   "aid": "0",
   "scy": "auto",
   "net": "${net_field}",
-  "type": "none",
+  "type": "${mode_field}",
   "host": "${DOMAIN}",
   "path": "/${WS_PATH}",
   "tls": "tls",
   "sni": "${DOMAIN}",
-  "alpn": "$([[ "${net}" == "h2" ]] && echo h2)",
+  "alpn": "$([[ "${net}" == "xhttp" ]] && echo h2)",
   "fp": "chrome"
 }
 EOF
@@ -2133,14 +2293,14 @@ show_qr() {
     echo "${url}" | qrencode -t ANSIUTF8
 }
 
-# h2 模式的客户端支持提示: 新版 v2rayN (7.10+ / 26.x 内核架构) 已从传输白名单
-# 移除 h2/http, 链接导入会被当作 raw 导致连接失败; v2rayNG 全版本可用。
-# 凡输出 h2 节点链接的入口 (安装完成 / 菜单 7 / 菜单 12 重置) 都调用本函数。
-show_h2_client_notice() {
-    log_warn "h2 模式客户端支持提示:"
-    log_warn "  - v2rayNG: 全版本支持,可正常导入使用"
-    log_warn "  - v2rayN: 仅 6.x 及更早旧版可用; 7.10+/26.x 新版已移除 h2 传输,"
-    log_warn "    导入会显示 raw 且无法连接。新版 v2rayN 用户请改用 ws 或 REALITY 模式"
+# xhttp 模式的客户端支持提示。
+# xhttp 由两个客户端在 2024-11 同期加入 (v2rayN 7.1.0 / v2rayNG 1.9.10), 之后一直保留;
+# 而旧的 h2 传输已被 Xray 内核删除, 老客户端才需要这条提示。
+# 凡输出 xhttp 节点链接的入口 (安装完成 / 菜单 7 / 菜单 12 重置) 都调用本函数。
+show_xhttp_client_notice() {
+    log_warn "xhttp 模式客户端支持提示:"
+    log_warn "  - v2rayN 7.1.0+ / v2rayNG 1.9.10+ 可直接导入使用"
+    log_warn "  - 更早的客户端不支持 xhttp 传输 (旧 h2 传输已被内核删除, 也无法使用)"
 }
 
 append_info() {
@@ -2173,9 +2333,9 @@ append_info() {
             echo "uuid=${UUID}"
             echo "dest=${REALITY_DEST}"
             echo "sni=${REALITY_SNI}"
-        elif [[ "${MODE}" == "h2" ]]; then
+        elif [[ "${MODE}" == "xhttp" ]]; then
             echo "domain=${DOMAIN}"
-            echo "port=${H2_PORT}"
+            echo "port=${XHTTP_PORT}"
             echo "uuid=${UUID}"
             echo "path=/${WS_PATH}"
         else
@@ -2209,7 +2369,7 @@ show_mode_info() {
     elif [[ "${MODE}" != "socks" ]]; then
         echo -e " 域名        : ${DOMAIN}"
     fi
-    echo -e " 端口        : $([[ "${MODE}" == "ws" ]] && echo "${WS_PORT:-443}" || { [[ "${MODE}" == "h2" ]] && echo "${H2_PORT}" || echo "${SOCKS_PORT}"; })"
+    echo -e " 端口        : $([[ "${MODE}" == "ws" ]] && echo "${WS_PORT:-443}" || { [[ "${MODE}" == "xhttp" ]] && echo "${XHTTP_PORT}" || echo "${SOCKS_PORT}"; })"
     if [[ "${MODE}" == "socks" ]]; then
         echo -e " 用户名      : ${SOCKS_USER}"
         echo -e " 密码        : ${SOCKS_PASS}"
@@ -2281,13 +2441,16 @@ collect_current_urls() {
         _urls_ref+=("工具格式2:socks5://${s_user}:${s_pass}@${ip}:${p}#socks5-${ip}")
     fi
 
-    # --- ws / h2: 域名从 nginx server_name 或证书 SAN 推导, 端口/uuid/path 从各自配置 ---
+    # --- ws / xhttp: 域名从 nginx server_name 或证书 SAN 推导, 端口/uuid/path 从各自配置 ---
+    # 同时识别旧版 h2 配置 (未跑菜单 15 迁移的机器), 保证菜单 7 反映真实安装状态
     local m conf svc
-    for m in ws h2; do
+    for m in ws xhttp h2; do
         if [[ "${m}" == "ws" ]]; then
             conf="${WS_CONF}"; svc="${WS_SERVICE}"
+        elif [[ "${m}" == "xhttp" ]]; then
+            conf="${XHTTP_CONF}"; svc="${XHTTP_SERVICE}"
         else
-            conf="${H2_CONF}"; svc="${H2_SERVICE}"
+            conf="${LEGACY_H2_CONF}"; svc="${LEGACY_H2_SERVICE}"
         fi
         [[ -f "${conf}" ]] || continue
         local m_uuid m_path m_port m_domain m_proto
@@ -2309,17 +2472,28 @@ collect_current_urls() {
             m_domain=""
         fi
         if [[ -z "${m_domain}" ]]; then
-            # 域名兜底: 证书 SAN (h2 或 nginx conf 缺 server_name 时)
+            # 域名兜底: 证书 SAN (xhttp/旧 h2 或 nginx conf 缺 server_name 时)
+            # -ext 需 OpenSSL 1.1.1+; 1.1.0 (Ubuntu 18.04) 报 "Unknown digest ext",
+            # 此时退回 -text 解析全文再提取 DNS: (输出更啰嗦但通用)
             m_domain="$(openssl x509 -in "${CRT_FILE}" -noout -ext subjectAltName 2>/dev/null \
                 | grep -o 'DNS:[^,]*' | head -1 | cut -d: -f2)"
+            if [[ -z "${m_domain}" ]]; then
+                m_domain="$(openssl x509 -in "${CRT_FILE}" -noout -text 2>/dev/null \
+                    | grep -A1 'Subject Alternative Name' | grep -o 'DNS:[^,]*' | head -1 | cut -d: -f2)"
+            fi
         fi
         [[ -n "${m_domain}" && -n "${m_uuid}" ]] || continue
         local enc_path m_url
         enc_path="$(url_encode "/${m_path}")"
         m_proto="$(grep -o '"protocol": "[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
-        # h2 的客户端侧网络名统一用 http (客户端白名单不含 h2), alpn=h2 锁定 HTTP/2
+        # 客户端侧网络名: xhttp 直接用; 旧 h2 配置沿用 http (历史上唯一能被旧客户端识别的写法)
         local net_field="${m}"
-        [[ "${net_field}" == "h2" ]] && net_field="http"
+        local xhttp_mode_json="none"
+        if [[ "${net_field}" == "h2" ]]; then
+            net_field="http"
+        elif [[ "${net_field}" == "xhttp" ]]; then
+            xhttp_mode_json="auto"
+        fi
         if [[ "${m_proto}" == "vmess" ]]; then
             local j b64
             j=$(cat <<EOF
@@ -2332,12 +2506,12 @@ collect_current_urls() {
   "aid": "0",
   "scy": "auto",
   "net": "${net_field}",
-  "type": "none",
+  "type": "${xhttp_mode_json}",
   "host": "${m_domain}",
   "path": "/${m_path}",
   "tls": "tls",
   "sni": "${m_domain}",
-  "alpn": "$([[ "${m}" == "h2" ]] && echo h2)",
+  "alpn": "$([[ "${m}" == "h2" || "${m}" == "xhttp" ]] && echo h2)",
   "fp": "chrome"
 }
 EOF
@@ -2345,7 +2519,10 @@ EOF
             b64=$(printf '%s' "${j}" | openssl base64 -A | tr -d '=')
             m_url="vmess://${b64}"
         else
-            m_url="vless://${m_uuid}@${m_domain}:${m_port}?type=${net_field}&security=tls&host=${m_domain}&path=${enc_path}&sni=${m_domain}&fp=chrome&encryption=none$([[ "${m}" == "h2" ]] && echo '&alpn=h2')#${m_domain}-${m_proto}-${m}"
+            local xhttp_extra=""
+            [[ "${m}" == "xhttp" ]] && xhttp_extra="&mode=auto&alpn=h2"
+            [[ "${m}" == "h2" ]] && xhttp_extra="&alpn=h2"
+            m_url="vless://${m_uuid}@${m_domain}:${m_port}?type=${net_field}&security=tls&host=${m_domain}&path=${enc_path}${xhttp_extra}&sni=${m_domain}&fp=chrome&encryption=none#${m_domain}-${m_proto}-${m}"
         fi
         _urls_ref+=("${m_url}")
     done
@@ -2366,7 +2543,11 @@ do_show_info() {
         return
     fi
 
-    local ol has_h2=0
+    # 提示判定看配置文件是否存在, 不看链接文本: vmess 链接是 base64,
+    # 无法用 "net": "xhttp" 之类的明文特征匹配 (vless 能匹配, vmess 不能)
+    local ol
+    local has_xhttp=0
+    [[ -f "${XHTTP_CONF}" ]] && has_xhttp=1
     for ol in "${exported[@]}"; do
         if [[ "${ol}" == 工具格式* ]]; then
             # socks 工具格式行 (菜单 7 专用展示, 不入导出文件)
@@ -2374,9 +2555,8 @@ do_show_info() {
             continue
         fi
         out_lines+=(" 分享链接: ${ol}")
-        [[ "${ol}" == *"type=http&"* || "${ol}" == *"\"net\": \"http\""* ]] && has_h2=1
     done
-    [[ "${has_h2}" == "1" ]] && show_h2_client_notice
+    [[ "${has_xhttp}" == "1" ]] && show_xhttp_client_notice
 
     clear
     echo -e "${GREEN}================ 已安装节点 (实时读取配置) ================${PLAIN}"
@@ -2395,7 +2575,7 @@ do_show_info() {
 do_uninstall() {
     check_root
     echo "当前已安装的服务:"
-    for svc in "${WS_SERVICE}" "${H2_SERVICE}" "${SOCKS_SERVICE}" "${REALITY_SERVICE}"; do
+    for svc in "${WS_SERVICE}" "${XHTTP_SERVICE}" "${SOCKS_SERVICE}" "${REALITY_SERVICE}" "${LEGACY_H2_SERVICE}"; do
         if [[ -f "/etc/systemd/system/${svc}.service" ]]; then
             local state="未运行"
             systemctl is-active --quiet "${svc}" && state="运行中"
@@ -2405,7 +2585,7 @@ do_uninstall() {
     echo
     echo "请选择要卸载的模式:"
     echo "  1. ws+tls (v2ray-ws + nginx 配置)"
-    echo "  2. h2+tls (v2ray-h2)"
+    echo "  2. xhttp+tls (xray-xhttp, 旧版为 v2ray-h2)"
     echo "  3. socks5 (v2ray-socks)"
     echo "  4. vless+REALITY (xray-reality)"
     echo "  5. 全部卸载"
@@ -2427,10 +2607,16 @@ do_uninstall() {
             sed -i '/### vmess+ws/,/^$/d;/### vless+ws/,/^$/d' "${INFO_FILE}" 2>/dev/null
             ;;
         2)
-            stop_service_sync "${H2_SERVICE}" v2ray
-            systemctl disable "${H2_SERVICE}" >/dev/null 2>&1
-            rm -f "/etc/systemd/system/${H2_SERVICE}.service" "${H2_CONF}"
-            sed -i '/### vmess+h2/,/^$/d;/### vless+h2/,/^$/d' "${INFO_FILE}" 2>/dev/null
+            # 新旧两套都要清: xhttp 模式 (xray-xhttp) 与未迁移的旧 h2 (v2ray-h2)
+            stop_service_sync "${XHTTP_SERVICE}" xray
+            systemctl disable "${XHTTP_SERVICE}" >/dev/null 2>&1
+            rm -f "/etc/systemd/system/${XHTTP_SERVICE}.service" "${XHTTP_CONF}"
+            if [[ -f "/etc/systemd/system/${LEGACY_H2_SERVICE}.service" || -f "${LEGACY_H2_CONF}" ]]; then
+                stop_service_sync "${LEGACY_H2_SERVICE}" v2ray
+                systemctl disable "${LEGACY_H2_SERVICE}" >/dev/null 2>&1
+                rm -f "/etc/systemd/system/${LEGACY_H2_SERVICE}.service" "${LEGACY_H2_CONF}"
+            fi
+            sed -i '/### vmess+h2/,/^$/d;/### vless+h2/,/^$/d;/### vmess+xhttp/,/^$/d;/### vless+xhttp/,/^$/d' "${INFO_FILE}" 2>/dev/null
             ;;
         3)
             stop_service_sync "${SOCKS_SERVICE}" v2ray
@@ -2446,14 +2632,17 @@ do_uninstall() {
             ;;
         5)
             stop_service_sync "${WS_SERVICE}" v2ray
-            stop_service_sync "${H2_SERVICE}" v2ray
+            stop_service_sync "${XHTTP_SERVICE}" xray
             stop_service_sync "${SOCKS_SERVICE}" v2ray
             stop_service_sync "${REALITY_SERVICE}" xray
-            systemctl disable "${WS_SERVICE}" "${H2_SERVICE}" "${SOCKS_SERVICE}" "${REALITY_SERVICE}" >/dev/null 2>&1
-            rm -f "/etc/systemd/system/${WS_SERVICE}.service" "/etc/systemd/system/${H2_SERVICE}.service" \
-                  "/etc/systemd/system/${SOCKS_SERVICE}.service" "/etc/systemd/system/${REALITY_SERVICE}.service"
+            # 未迁移的旧 h2 服务一并停用清理
+            stop_service_sync "${LEGACY_H2_SERVICE}" v2ray
+            systemctl disable "${WS_SERVICE}" "${XHTTP_SERVICE}" "${SOCKS_SERVICE}" "${REALITY_SERVICE}" "${LEGACY_H2_SERVICE}" >/dev/null 2>&1
+            rm -f "/etc/systemd/system/${WS_SERVICE}.service" "/etc/systemd/system/${XHTTP_SERVICE}.service" \
+                  "/etc/systemd/system/${SOCKS_SERVICE}.service" "/etc/systemd/system/${REALITY_SERVICE}.service" \
+                  "/etc/systemd/system/${LEGACY_H2_SERVICE}.service"
             rm -f "${WS_NGINX_CONF}" "/etc/nginx/conf.d/v2ray-ws-tls.conf" "${BT_NGINX_VHOST_DIR}/v2ray-ws-tls.conf" \
-                  "${WS_CONF}" "${H2_CONF}" "${SOCKS_CONF}" "${REALITY_CONF}" \
+                  "${WS_CONF}" "${XHTTP_CONF}" "${SOCKS_CONF}" "${REALITY_CONF}" "${LEGACY_H2_CONF}" \
                   "${INFO_FILE}" "${URL_FILE}" "${SSL_UPDATE_SH}"
             if [[ -f /usr/local/bin/v2ray-uninstall ]]; then
                 bash /usr/local/bin/v2ray-uninstall || true
@@ -2629,7 +2818,7 @@ do_reset_reality() {
     log_confirm "客户端请删除旧节点并导入上面的新链接 (旧链接已失效)。"
 }
 
-# 重置 ws/h2/socks 节点要素: 选模式 -> 选要素 -> 改配置重启 -> 失败回滚 -> 重建分享链接
+# 重置 ws/xhttp/socks 节点要素: 选模式 -> 选要素 -> 改配置重启 -> 失败回滚 -> 重建分享链接
 do_reset_node() {
     check_root
     # 必须局部化: b 分支会递归调用本函数, 全局残留会让上一轮的
@@ -2638,9 +2827,9 @@ do_reset_node() {
     local reset_port=0 reset_uuid=0 reset_creds=0
     while :; do
         echo "请选择要重置的节点模式:"
-        echo "  1. ws+tls   (v2ray-ws)"
-        echo "  2. h2+tls   (v2ray-h2)"
-        echo "  3. socks5   (v2ray-socks)"
+        echo "  1. ws+tls     (v2ray-ws)"
+        echo "  2. xhttp+tls  (xray-xhttp)"
+        echo "  3. socks5     (v2ray-socks)"
         echo "  0. 返回主菜单"
         read -rp "请选择: " mode_pick || return
 
@@ -2648,7 +2837,7 @@ do_reset_node() {
         local is_socks=0 new_internal=""
         case "${mode_pick}" in
             1) conf="${WS_CONF}";   svc="${WS_SERVICE}";   svc_label="ws+tls" ;;
-            2) conf="${H2_CONF}";   svc="${H2_SERVICE}";   svc_label="h2+tls" ;;
+            2) conf="${XHTTP_CONF}";   svc="${XHTTP_SERVICE}";   svc_label="xhttp+tls" ;;
             3) conf="${SOCKS_CONF}"; svc="${SOCKS_SERVICE}"; svc_label="socks5"; is_socks=1 ;;
             0|*) return ;;
         esac
@@ -2720,7 +2909,7 @@ do_reset_node() {
     else
         old_port="$(grep -o '"port": [0-9]*' "${conf}" | head -1 | grep -o '[0-9]*')"
         if [[ "${reset_port:-0}" == "1" ]]; then
-            if ! pick_port "新端口 (ws 为客户端连接端口, h2 为服务端口)" 8443; then
+            if ! pick_port "新端口 (ws 为客户端连接端口, xhttp 为服务端口)" 8443; then
                 log_info "已取消重置 (原配置未动)。"
                 rm -f "${conf}.bak"
                 return 1
@@ -2765,7 +2954,7 @@ do_reset_node() {
                     log_info "ws 模式: 对外监听端口 ${old_ws_port} -> ${new_ws_port} (nginx 配置将一并 reload)。"
                 fi
             else
-                H2_PORT="${new_port}"
+                XHTTP_PORT="${new_port}"
                 INTERNAL_PORT="${new_port}"
             fi
             changed+=("端口 ${old_port} -> ${new_port}")
@@ -2842,7 +3031,14 @@ do_reset_node() {
         CLIENT_REMARK="${CLIENT_REMARK:-socks5-${PUBLIC_IP:-$(get_public_ip && echo "${PUBLIC_IP:-server}")}}"
         CLIENT_REMARK="${CLIENT_REMARK//[$'\r\n']/}"
     else
-        MODE="${mode_pick}"; PROTOCOL="vless"
+        # mode_pick 是菜单序号 (1=ws 2=xhttp 3=socks), 不能直接当 MODE 用:
+        # build_share_link 按 MODE 的语义名分派, 传序号会全部落到 ws 分支。
+        if [[ "${mode_pick}" == "1" ]]; then
+            MODE="ws"
+        else
+            MODE="xhttp"
+        fi
+        PROTOCOL="vless"
         # 实际安装协议可能为 vmess (安装时决定), 从 info 段落名恢复, 保持段落名不变
         local section_key="${svc_label%%+*}"
         local infoblock
@@ -2859,7 +3055,7 @@ do_reset_node() {
             WS_PORT="$(grep -m1 -oE "listen [0-9]+ ssl" "${WS_NGINX_CONF}" | grep -o "[0-9]*")"
             WS_PORT="${WS_PORT:-443}"
         else
-            H2_PORT="$(grep -o '"port": [0-9]*' "${conf}" | head -1 | grep -o '[0-9]*')"
+            XHTTP_PORT="$(grep -o '"port": [0-9]*' "${conf}" | head -1 | grep -o '[0-9]*')"
         fi
         CLIENT_REMARK="${DOMAIN}-${PROTOCOL}-${svc_label%%+*}"
     fi
@@ -2879,7 +3075,7 @@ do_reset_node() {
     echo -e " 新链接   : ${SHARE_URL}"
     [[ -n "${SHARE_URL_PLAIN:-}" ]] && echo -e " 工具格式 : ${SHARE_URL_PLAIN}"
     [[ -n "${SHARE_URL_PLAIN2:-}" ]] && echo -e " 工具格式2: ${SHARE_URL_PLAIN2}"
-    [[ "${svc_label}" == "h2+tls" ]] && show_h2_client_notice
+    [[ "${svc_label}" == "xhttp+tls" ]] && show_xhttp_client_notice
     echo -e "${GREEN}==========================================${PLAIN}"
     show_qr "${SHARE_URL}"
     log_confirm "客户端请删除旧节点并导入上面的新链接 (旧链接已失效)。"
@@ -2899,7 +3095,7 @@ sync_info_block() {
         inblk && /^share_url=/ {print newurl; inblk=2; next}
         inblk == 2 && /^port=/ {
             if (mode == "socks") print "port=" socks_port
-            else if (mode == "h2") print "port=" h2_port
+            else if (mode == "h2" || mode == "xhttp") print "port=" h2_port
             else if (mode == "reality") print "port=" reality_port
             else print "port=" ws_port
             next
@@ -2909,7 +3105,7 @@ sync_info_block() {
         inblk == 2 && /^socks_pass=/ {print "socks_pass=" socks_pass; next}
         inblk == 2 && /^### / {inblk=0}
         {print}
-    ' mode="${MODE}" socks_port="${SOCKS_PORT:-}" h2_port="${H2_PORT:-}" ws_port="${WS_PORT:-443}" \
+    ' mode="${MODE}" socks_port="${SOCKS_PORT:-}" h2_port="${XHTTP_PORT:-}" ws_port="${WS_PORT:-443}" \
       reality_port="${REALITY_PORT:-}" uuid="${UUID:-}" \
       socks_user="${SOCKS_USER:-}" socks_pass="${SOCKS_PASS:-}" \
       "${INFO_FILE}" > "${tmp}" && mv -f "${tmp}" "${INFO_FILE}"
@@ -3071,7 +3267,7 @@ do_update_v2ray() {
     # 与 ensure_xray 同样处理: 停用禁用, 只保留本脚本的 xray-reality.service
     systemctl stop xray 2>/dev/null || true
     systemctl disable xray >/dev/null 2>&1 || true
-    systemctl restart "${WS_SERVICE}" "${H2_SERVICE}" "${SOCKS_SERVICE}" "${REALITY_SERVICE}" 2>/dev/null
+    systemctl restart "${WS_SERVICE}" "${XHTTP_SERVICE}" "${SOCKS_SERVICE}" "${REALITY_SERVICE}" 2>/dev/null
     log_info "V2Ray / Xray 已更新,相关服务已重启。"
 }
 
@@ -3080,12 +3276,17 @@ do_update_v2ray() {
 do_install() {
     check_root
     check_system
+    # 未真机验证的系列 (RHEL 系) 在交互模式下要求确认, 非交互下只保留警告
+    if ! confirm_untested_distro; then
+        log_info "已取消安装。"
+        exit 0
+    fi
     preflight_check
     install_dependencies
 
     case "${MODE}" in
         ws)      do_install_ws ;;
-        h2)      do_install_h2 ;;
+        xhttp)   do_install_xhttp ;;
         socks)   do_install_socks ;;
         reality) do_install_reality ;;
     esac
@@ -3097,21 +3298,21 @@ show_menu() {
     clear
     echo -e "${GREEN}====================================================${PLAIN}"
     echo -e "${GREEN}          V2Ray/Xray 多模式一键脚本                 ${PLAIN}"
-    echo -e "${GREEN}  ws/h2/socks5/REALITY 可同时安装互不冲突           ${PLAIN}"
+    echo -e "${GREEN}  ws/xhttp/socks5/REALITY 可同时安装互不冲突        ${PLAIN}"
     echo -e "${GREEN}          适配最新版 v2rayN / v2rayNG               ${PLAIN}"
     echo -e "${GREEN}====================================================${PLAIN}"
-    echo -e " 1. 安装  vmess + ws  + tls  (Nginx 伪装站, 443)"
-    echo -e " 2. 安装  vless + ws  + tls  (Nginx 伪装站, 443)"
-    echo -e " 3. 安装  vmess + h2  + tls  (V2Ray 直连, 独立端口)"
-    echo -e " 4. 安装  vless + h2  + tls  (V2Ray 直连, 独立端口)"
-    echo -e " 5. 安装  socks5             (独立端口, 带认证)"
-    echo -e " 6. 安装  vless + REALITY    (Xray, 抗封锁首选, 免域名证书)"
+    echo -e " 1. 安装  vmess + ws    + tls  (Nginx 伪装站, 443)"
+    echo -e " 2. 安装  vless + ws    + tls  (Nginx 伪装站, 443)"
+    echo -e " 3. 安装  vmess + xhttp + tls  (Xray 直连, 独立端口)"
+    echo -e " 4. 安装  vless + xhttp + tls  (Xray 直连, 独立端口)"
+    echo -e " 5. 安装  socks5               (独立端口, 带认证)"
+    echo -e " 6. 安装  vless + REALITY      (Xray, 抗封锁首选, 免域名证书)"
     echo -e " 7. 查看已安装节点 / 导出全部分享链接"
     echo -e " 8. 手动续签 / 重新申请证书"
     echo -e " 9. 更新 V2Ray / Xray core"
     echo -e "10. 更换 REALITY 伪装站 (保留 UUID/端口, 客户端只改 SNI)"
     echo -e "11. 重置 REALITY 节点 (端口 / UUID / 密钥 / 全部)"
-    echo -e "12. 重置 ws/h2/socks 节点 (端口 / UUID / 用户密码)"
+    echo -e "12. 重置 ws/xhttp/socks 节点 (端口 / UUID / 用户密码)"
     echo -e "13. 卸载 (可选单模式或全部)"
     echo -e "14. 更新脚本 (从 GitHub 下载最新版覆盖本脚本)"
     echo -e "15. 升级已装节点配置 (保留 UUID/端口/密钥, 补齐新版功能)"
@@ -3121,8 +3322,8 @@ show_menu() {
     case "${choice}" in
         1) MODE="ws";      PROTOCOL="vmess"; do_install ;;
         2) MODE="ws";      PROTOCOL="vless"; do_install ;;
-        3) MODE="h2";      PROTOCOL="vmess"; do_install ;;
-        4) MODE="h2";      PROTOCOL="vless"; do_install ;;
+        3) MODE="xhttp";   PROTOCOL="vmess"; do_install ;;
+        4) MODE="xhttp";   PROTOCOL="vless"; do_install ;;
         5) MODE="socks";   PROTOCOL="";      do_install ;;
         6) MODE="reality"; PROTOCOL="vless"; do_install ;;
         7) do_show_info ;;
@@ -3159,6 +3360,7 @@ MIGRATION_STATE="${V2RAY_CONF_DIR}/migrations_done.txt"
 # 迁移注册表: "版本|函数名|描述" (按版本从旧到新排序, 追加到末尾)
 MIGRATIONS=(
     "1.3.0|migr_useipv4|所有模式 freedom 出站补 domainStrategy=UseIPv4"
+    "1.5.0|migr_h2_to_xhttp|h2 节点迁移到 xhttp 传输 (h2 已被内核删除, 核心换 Xray)"
 )
 
 # --- 迁移: 1.3.0 freedom 出站 UseIPv4 ---
@@ -3200,12 +3402,96 @@ migr_useipv4() {
     return 0
 }
 
+# --- 迁移: 1.5.0 h2 传输 -> xhttp (含核心 v2ray -> xray) ---
+# 背景: Xray 自 v24.12.31 删除 HTTP(h2) 传输, v2rayN 的 Networks 白名单也已移除
+# h2/http, 因此 h2 节点对当前客户端全部失效。xhttp 是官方继任者。
+# 本迁移做四件事, 全部成功后写入 state:
+#   1. 把 config_h2.json 搬到 config_xhttp.json (保留 UUID/端口/path 不动)
+#   2. streamSettings 里 network h2->xhttp, httpSettings 键改名 xhttpSettings
+#   3. tlsSettings 的 alpn 保持 ["h2"] (xhttp 跑在 HTTP/2 之上)
+#   4. 服务单元从 v2ray-h2 (v2ray 核心) 换成 xray-xhttp (xray 核心)
+# 幂等: 已无 config_h2.json 或已是 xhttp 则跳过。旧 h2 文件保留备份, 不删。
+migr_h2_to_xhttp() {
+    # 与 migr_useipv4 不同, 本迁移跨文件/跨服务, 通用执行器传入的 $1/$2
+    # 是 xhttp 的目标路径与 xray 二进制; 旧 h2 配置另按 LEGACY_H2_CONF 处理。
+    # 执行器会把本函数对四种配置各调一次, 只有目标为 xhttp 路径时才动作,
+    # 否则会误把 h2 配置写到别的模式上。
+    local conf="$1" bin="$2"
+    [[ "${conf}" == "${XHTTP_CONF}" ]] || return 0
+    [[ -f "${LEGACY_H2_CONF}" ]] || return 0    # 没装过旧 h2, 跳过 (幂等)
+
+    # 1) 旧配置搬到新路径 (若目标已存在说明已迁移过, 只清理旧文件)
+    if [[ -f "${conf}" ]]; then
+        log_warn "  检测到 config_h2.json 与 config_xhttp.json 并存, 以 xhttp 为准, 移除旧文件。"
+        rm -f "${LEGACY_H2_CONF}"
+    else
+        cp -a "${LEGACY_H2_CONF}" "${conf}" || return 1
+    fi
+
+    # 2) 传输改为 xhttp: 键名与值一起换
+    #    旧模板结构:  "network": "h2",  ... "httpSettings": { "path": ... }
+    #    目标结构:    "network": "xhttp", ... "xhttpSettings": { "path": ... }
+    if grep -q '"network": *"h2"' "${conf}"; then
+        sed -i 's/"network": *"h2"/"network": "xhttp"/' "${conf}" || return 1
+    fi
+    if grep -q '"httpSettings"' "${conf}"; then
+        sed -i 's/"httpSettings"/"xhttpSettings"/' "${conf}" || return 1
+    fi
+    # 兜底: 手工改过的配置可能既无 network 也无 httpSettings, 视为无法迁移
+    if ! grep -q '"network": *"xhttp"' "${conf}"; then
+        log_error "  无法在 ${conf} 定位 h2 传输字段, 实际结构:"
+        grep -n '"network"\|Settings"' "${conf}" | head -10
+        return 1
+    fi
+    # 旧模板没有 xhttpSettings 时补一个 (只带 path, 值取自原 httpSettings 或空)
+    # 用 awk 而非 sed 的 \n 插入: busybox sed 对替换串里的 \n 支持不一致
+    # (Alpine 等精简系统会写出字面 \n), awk 在各发行版的 awk 实现上行为一致。
+    if ! grep -q '"xhttpSettings"' "${conf}"; then
+        local old_path
+        old_path="$(grep -o '"path": "/[^"]*"' "${conf}" | head -1 | cut -d'"' -f4)"
+        old_path="${old_path:-/xhttp}"
+        awk -v p="${old_path}" '
+            {
+                print
+                if ($0 ~ /"network": *"xhttp",/) {
+                    print "        \"xhttpSettings\": {"
+                    print "          \"path\": \"" p "\""
+                    print "        },"
+                }
+            }
+        ' "${conf}" > "${conf}.migr.$$" && mv -f "${conf}.migr.$$" "${conf}" || return 1
+    fi
+
+    # 3) 用 Xray 校验新配置 (xhttp 只有 Xray 认)
+    if [[ -x "${bin}" ]]; then
+        validate_core_config "${bin}" "${conf}" || return 1
+    fi
+    fix_config_perm "${conf}"
+
+    # 4) 服务单元: 停旧起新。旧 unit 删掉, 新 unit 由 write_xhttp_service 生成
+    if [[ -f "/etc/systemd/system/${LEGACY_H2_SERVICE}.service" ]]; then
+        stop_service_sync "${LEGACY_H2_SERVICE}" v2ray
+        systemctl disable "${LEGACY_H2_SERVICE}" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/${LEGACY_H2_SERVICE}.service"
+    fi
+    # 生成新 unit 需要 XHTTP_CONF/XHTTP_PORT 已就位; 端口从配置现场读取
+    XHTTP_PORT="$(grep -o '"port": [0-9]*' "${conf}" | head -1 | grep -o '[0-9]*')"
+    if ! write_xhttp_service; then
+        log_error "  无法生成 ${XHTTP_SERVICE} 服务单元。"
+        return 1
+    fi
+
+    # 旧配置改名保留为备份, 便于回滚; 不参与任何后续逻辑
+    mv -f "${LEGACY_H2_CONF}" "${LEGACY_H2_CONF}.migrated" 2>/dev/null || rm -f "${LEGACY_H2_CONF}"
+    return 0
+}
+
 # 迁移通用执行器: 逐条检查 state, 未应用的执行, 失败回滚该条并继续报告
 do_upgrade_nodes() {
     check_root
     local applied=0 skipped=0 failed=0
     local any_installed=0
-    for c in "${REALITY_CONF}" "${WS_CONF}" "${H2_CONF}" "${SOCKS_CONF}"; do
+    for c in "${REALITY_CONF}" "${WS_CONF}" "${XHTTP_CONF}" "${SOCKS_CONF}" "${LEGACY_H2_CONF}"; do
         [[ -f "${c}" ]] && any_installed=1
     done
     if [[ "${any_installed}" == "0" ]]; then
@@ -3230,16 +3516,33 @@ do_upgrade_nodes() {
         # 五种模式逐个补 (未安装的配置在迁移函数内部检测后跳过)
         for pair in "${REALITY_CONF}:/usr/local/bin/xray:${REALITY_SERVICE}" \
                     "${WS_CONF}:/usr/local/bin/v2ray:${WS_SERVICE}" \
-                    "${H2_CONF}:/usr/local/bin/v2ray:${H2_SERVICE}" \
+                    "${XHTTP_CONF}:/usr/local/bin/xray:${XHTTP_SERVICE}" \
                     "${SOCKS_CONF}:/usr/local/bin/v2ray:${SOCKS_SERVICE}"; do
             conf="${pair%%:*}"
             bin="${pair#*:}"; bin="${bin%%:*}"
             svc_name="${pair##*:}"
-            [[ -f "${conf}" ]] || continue
-            cp -a "${conf}" "${conf}.migrbak" || { entry_failed=1; break; }
+            # 源文件判定: 一般迁移的源就是目标配置; 但 h2->xhttp 的源是旧
+            # config_h2.json, 目标 config_xhttp.json 此时尚未生成, 需单独放行,
+            # 否则该迁移永远不会被调用。
+            local src_ok=0
+            [[ -f "${conf}" ]] && src_ok=1
+            if [[ "${fn}" == "migr_h2_to_xhttp" && "${conf}" == "${XHTTP_CONF}" && -f "${LEGACY_H2_CONF}" ]]; then
+                src_ok=1
+            fi
+            [[ "${src_ok}" == "1" ]] || continue
+            # 目标配置不存在时 (h2->xhttp 首次迁移) 没有可备份的旧目标, 回滚靠删新建文件
+            local had_target=0
+            if [[ -f "${conf}" ]]; then
+                cp -a "${conf}" "${conf}.migrbak" || { entry_failed=1; break; }
+                had_target=1
+            fi
             if ! "${fn}" "${conf}" "${bin}"; then
                 log_error "  ${svc_name}: 迁移失败,已回滚。"
-                mv -f "${conf}.migrbak" "${conf}"
+                if [[ "${had_target}" == "1" ]]; then
+                    mv -f "${conf}.migrbak" "${conf}"
+                else
+                    rm -f "${conf}"
+                fi
                 fix_config_perm "${conf}"
                 entry_failed=1
                 break
@@ -3334,11 +3637,15 @@ do_self_update() {
 }
 
 main() {
-    # 非交互入口: install.sh <ws|h2|socks|reality> [vmess|vless]
+    # 非交互入口: install.sh <ws|xhttp|socks|reality> [vmess|vless]
+    # h2 作为旧参数名保留为别名 (历史文档/用户脚本里可能还在用), 统一映射到 xhttp
     if [[ -n "${1:-}" ]]; then
         case "${1}" in
-            ws|h2)
-                MODE="${1}"
+            ws|xhttp|h2)
+                case "${1}" in
+                    ws)    MODE="ws" ;;
+                    *)     MODE="xhttp" ;;
+                esac
                 PROTOCOL="${2:-vmess}"
                 [[ "${PROTOCOL}" != "vmess" && "${PROTOCOL}" != "vless" ]] && { log_error "协议只支持 vmess 或 vless"; exit 1; }
                 do_install
