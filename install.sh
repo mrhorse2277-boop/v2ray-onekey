@@ -3904,29 +3904,32 @@ get_disk_script_version() {
 }
 
 # 菜单头部的版本状态行: 本地版本 + 最新版本 + 状态标识
+# 菜单头部的版本状态 (三项竖排, 每项独立一行, 与 52 列边框对齐)。
+# 横排单行在最长情形下约 58 列会撑破边框, 且各行宽度参差 (45~58), 故改竖排:
+#   当前版本 : v1.5.2
+#   最新版本 : v1.5.3
+#   更新状态 : 🔴 建议更新 (菜单 14)
 show_version_line() {
-    local latest local_ver
+    local latest local_ver status
     local_ver="$(get_disk_script_version)"
     latest="$(get_latest_version)"
 
-    # 磁盘版本与运行中版本不一致: 说明脚本已被更新, 当前进程还是旧的
-    local pending_note=""
-    if [[ "${local_ver}" != "${SCRIPT_VERSION}" ]]; then
-        pending_note="  (脚本已更新至 v${local_ver}, 重新运行生效)"
+    if [[ -z "${latest}" ]]; then
+        status="⚪ 检测失败 (网络不通)"
+    elif version_gt "${latest}" "${local_ver}"; then
+        status="${RED}🔴 建议更新 (菜单 14)${GREEN}"
+    elif version_gt "${local_ver}" "${latest}"; then
+        status="🟢 已是最新 (本地版本较新)"
+    else
+        status="🟢 无需更新"
     fi
 
-    if [[ -z "${latest}" ]]; then
-        # 取不到最新版本 (离线/GitHub 不可达): 只显示本地版本, 不误导
-        echo -e "${GREEN}  当前版本 v${local_ver}  |  最新版本 检测失败(网络)${pending_note}${PLAIN}"
-        return 0
-    fi
-    if version_gt "${latest}" "${local_ver}"; then
-        echo -e "${GREEN}  当前版本 v${local_ver}  |  最新版本 v${latest}  ${RED}🔴 建议更新(菜单14)${PLAIN}${pending_note}"
-    elif version_gt "${local_ver}" "${latest}"; then
-        # 本地比远端新 (开发版/刚提交未同步, 或 CDN 尚未刷新): 不提示更新
-        echo -e "${GREEN}  当前版本 v${local_ver}  |  最新版本 v${latest}  🟢 本地为较新版本${PLAIN}${pending_note}"
-    else
-        echo -e "${GREEN}  当前版本 v${local_ver}  |  最新版本 v${latest}  🟢 无需更新${PLAIN}${pending_note}"
+    echo -e "${GREEN}  当前版本 : v${local_ver}${PLAIN}"
+    echo -e "${GREEN}  最新版本 : v${latest:-未知}${PLAIN}"
+    echo -e "${GREEN}  更新状态 : ${status}${PLAIN}"
+    # 磁盘已更新但当前进程仍是旧版: 单独一行提示
+    if [[ "${local_ver}" != "${SCRIPT_VERSION}" ]]; then
+        echo -e "${YELLOW}  (脚本已更新至 v${local_ver}, 请重新运行生效)${PLAIN}"
     fi
 }
 
