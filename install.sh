@@ -48,7 +48,7 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.5.2"
+SCRIPT_VERSION="1.5.3"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 # 最新版本号缓存: 菜单每次刷新都联网会很慢 (尤其 GitHub 被墙时), 缓存 6 小时
 # 格式: "<时间戳>|<版本号>" ; 取不到版本时写 "0|" 表示未知
@@ -3610,6 +3610,47 @@ MIGRATIONS=(
     "1.5.0|migr_h2_to_xhttp|h2 节点迁移到 xhttp 传输 (h2 已被内核删除, 核心换 Xray)"
 )
 
+# --- 待升级项检测 (只读, 供菜单头部提示用) ---
+# 不用 MIGRATION_STATE 判定, 而是按配置实际内容判定, 原因:
+#   1) 全新安装从未写过 state 文件, 只看 state 会把已符合新模板的机器误报为"待升级"
+#   2) 手工改过配置的机器, state 与实际也可能不一致
+# 约定: 每条迁移配一个 "<迁移函数名>_check" 探针, 返回 0 表示"本机仍有待做的部分";
+# 没写探针的迁移退回 state 文件判定 (兼容以后新增但忘了写探针的情况)。
+migr_useipv4_check() {
+    local conf
+    for conf in "${REALITY_CONF}" "${WS_CONF}" "${XHTTP_CONF}" "${SOCKS_CONF}"; do
+        [[ -f "${conf}" ]] || continue
+        grep -q '"domainStrategy"' "${conf}" || return 0   # 有一个模式缺字段就待升级
+    done
+    return 1
+}
+
+migr_h2_to_xhttp_check() {
+    # 旧 h2 配置还在就说明没迁完 (迁移成功时会改名为 .migrated 备份)。
+    # 即使内容已不是 h2 (迁移做到一半), 也按待升级处理, 让用户跑菜单 15 收尾。
+    [[ -f "${LEGACY_H2_CONF}" ]]
+}
+
+# 返回待升级条数; -1 表示本机没有已装节点 (菜单不显示该行)
+count_pending_migrations() {
+    local conf entry ver rest fn checker n=0 any_installed=0
+    for conf in "${REALITY_CONF}" "${WS_CONF}" "${XHTTP_CONF}" "${SOCKS_CONF}" "${LEGACY_H2_CONF}"; do
+        [[ -f "${conf}" ]] && any_installed=1
+    done
+    [[ "${any_installed}" == "1" ]] || { echo "-1"; return 0; }
+    for entry in "${MIGRATIONS[@]}"; do
+        ver="${entry%%|*}"; rest="${entry#*|}"
+        fn="${rest%%|*}"
+        checker="${fn}_check"
+        if declare -F "${checker}" >/dev/null 2>&1; then
+            "${checker}" && n=$((n+1))
+        elif ! grep -q "^${ver}|${fn}$" "${MIGRATION_STATE}" 2>/dev/null; then
+            n=$((n+1))
+        fi
+    done
+    echo "${n}"
+}
+
 # --- 迁移: 1.3.0 freedom 出站 UseIPv4 ---
 # 配置由本脚本生成, 但存量机器可能被手工改过, freedom 行有两种常见形态:
 #   "protocol": "freedom",   (1.3.0+ 模板, 尾逗号)
@@ -3903,30 +3944,50 @@ get_disk_script_version() {
     fi
 }
 
-# 菜单头部的版本状态行: 本地版本 + 最新版本 + 状态标识
-# 菜单头部的版本状态 (三项竖排, 每项独立一行, 与 52 列边框对齐)。
-# 横排单行在最长情形下约 58 列会撑破边框, 且各行宽度参差 (45~58), 故改竖排:
-#   当前版本 : v1.5.2
-#   最新版本 : v1.5.3
-#   更新状态 : 🔴 建议更新 (菜单 14)
+# 菜单头部的状态区: 两行, 一行脚本版本, 一行已装节点配置。
+# 竖排三项 (当前/最新/状态) 各占一行会让头部过高且右侧大片留白, 改为
+# "版本对 + 状态" 合并到一行, 节点配置另起一行, 两行宽度都在边框内 (≤52 列):
+#   脚本版本 : v1.5.2 → v1.5.3  🔴 建议更新 (菜单 14)
+#   节点配置 : 🔴 2 条待升级 (菜单 15)
+# 状态取值: 🟢 无需更新 / 🔴 建议更新 / 🟢 本地较新 / ⚪ 检测失败 (网络不通)
 show_version_line() {
-    local latest local_ver status
+    local latest local_ver status pending_line pending_n
+
     local_ver="$(get_disk_script_version)"
     latest="$(get_latest_version)"
 
     if [[ -z "${latest}" ]]; then
+        latest="未知"
         status="⚪ 检测失败 (网络不通)"
     elif version_gt "${latest}" "${local_ver}"; then
         status="${RED}🔴 建议更新 (菜单 14)${GREEN}"
     elif version_gt "${local_ver}" "${latest}"; then
-        status="🟢 已是最新 (本地版本较新)"
+        status="🟢 本地较新"
     else
+        # 版本相同: 只显示一个版本号, "v1.5.3 → v1.5.3" 是冗余信息
+        latest="${local_ver}"
         status="🟢 无需更新"
     fi
 
-    echo -e "${GREEN}  当前版本 : v${local_ver}${PLAIN}"
-    echo -e "${GREEN}  最新版本 : v${latest:-未知}${PLAIN}"
-    echo -e "${GREEN}  更新状态 : ${status}${PLAIN}"
+    if [[ -z "${latest}" || "${latest}" == "未知" ]]; then
+        echo -e "${GREEN}  脚本版本 : v${local_ver}  ${status}${PLAIN}"
+    elif [[ "${latest}" == "${local_ver}" ]]; then
+        echo -e "${GREEN}  脚本版本 : v${local_ver}  ${status}${PLAIN}"
+    else
+        echo -e "${GREEN}  脚本版本 : v${local_ver} → v${latest}  ${status}${PLAIN}"
+    fi
+
+    # 已装节点配置: 只做只读检测, 精确到"有几条迁移没做"
+    pending_n="$(count_pending_migrations)"
+    if [[ "${pending_n}" == "-1" ]]; then
+        pending_line="未安装节点 (菜单 1-6)"
+    elif [[ "${pending_n}" == "0" ]]; then
+        pending_line="🟢 已是最新配置, 无需升级"
+    else
+        pending_line="${RED}🔴 ${pending_n} 条待升级 (菜单 15)${GREEN}"
+    fi
+    echo -e "${GREEN}  节点配置 : ${pending_line}${PLAIN}"
+
     # 磁盘已更新但当前进程仍是旧版: 单独一行提示
     if [[ "${local_ver}" != "${SCRIPT_VERSION}" ]]; then
         echo -e "${YELLOW}  (脚本已更新至 v${local_ver}, 请重新运行生效)${PLAIN}"
