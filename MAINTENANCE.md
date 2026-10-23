@@ -162,6 +162,12 @@ systemd-run --machine=t11 --quiet --pipe --wait /bin/bash -c 'systemctl is-syste
   `settings.domainStrategy=UseIPv4`(60f59ca,用户 VPS IPv6 回程不稳),
   改配置模板时别丢;手工给存量机器补这个参数用 sed 定位
   `"protocol": "freedom"` 插入 settings 块
+- **菜单版本提示**: 菜单头部显示"当前版本/最新版本"状态(🔴建议更新 / 🟢无需更新)。
+  最新版本号缓存在 `/usr/local/etc/v2ray/latest_version.cache`(6 小时 TTL,
+  格式 `时间戳|版本号`, 失败写 `时间戳|`), 避免每次进菜单联网。
+  改菜单刷新逻辑时别去掉缓存, 否则 GitHub 被墙环境下每次刷新都会卡 8s。
+  版本比较用 `version_gt`(逐段数值比较), **不能用字符串比较**——
+  `"1.5.10" < "1.5.2"` 在字符串比较下成立, 会误判。
 - **脚本自更新(菜单 14)**:`SCRIPT_VERSION` 是版本对比的唯一依据,
   **每次改完脚本必须手动递增**(不一致才触发覆盖,相同则提示已是最新);
   自更新带合法性(grep 标识)+语法(bash -n)双校验和备份回滚

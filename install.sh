@@ -48,8 +48,12 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.5.1"
+SCRIPT_VERSION="1.5.2"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
+# 最新版本号缓存: 菜单每次刷新都联网会很慢 (尤其 GitHub 被墙时), 缓存 6 小时
+# 格式: "<时间戳>|<版本号>" ; 取不到版本时写 "0|" 表示未知
+VERSION_CACHE="${V2RAY_CONF_DIR}/latest_version.cache"
+VERSION_CACHE_TTL=21600   # 6 小时
 
 CERT_DIR="/data"
 CRT_FILE="${CERT_DIR}/v2ray.crt"
@@ -3542,6 +3546,8 @@ show_menu() {
     echo -e "${GREEN}  ws/xhttp/socks5/REALITY 可同时安装互不冲突        ${PLAIN}"
     echo -e "${GREEN}          适配最新版 v2rayN / v2rayNG               ${PLAIN}"
     echo -e "${GREEN}====================================================${PLAIN}"
+    show_version_line
+    echo -e "${GREEN}====================================================${PLAIN}"
     echo -e " 1. 安装  vmess + ws    + tls  (Nginx 伪装站, 443)"
     echo -e " 2. 安装  vless + ws    + tls  (Nginx 伪装站, 443)"
     echo -e " 3. 安装  vmess + xhttp + tls  (Xray 直连, 独立端口)"
@@ -3823,6 +3829,84 @@ do_upgrade_nodes() {
     return 0
 }
 
+# 版本号比较: $1 > $2 返回 0 (真), 否则 1。
+# 只处理点分数字 (如 1.5.2 vs 1.5.10), 按数值逐段比较, 避免字符串比较把
+# "1.5.10" 判成小于 "1.5.2"。非数字段按 0 处理。
+version_gt() {
+    local a="$1" b="$2"
+    local IFS=.
+    # shellcheck disable=SC2206
+    local av=($a) bv=($b)
+    local i n
+    n=${#av[@]}
+    (( ${#bv[@]} > n )) && n=${#bv[@]}
+    for (( i=0; i<n; i++ )); do
+        local x="${av[i]:-0}" y="${bv[i]:-0}"
+        [[ "${x}" =~ ^[0-9]+$ ]] || x=0
+        [[ "${y}" =~ ^[0-9]+$ ]] || y=0
+        if (( x > y )); then return 0; fi
+        if (( x < y )); then return 1; fi
+    done
+    return 1
+}
+
+# 获取最新版本号 (带缓存)。输出到 stdout, 取不到时输出空。
+# 缓存命中直接返回, 避免每次刷新菜单都联网 (GitHub 被墙时会卡 10s+)。
+get_latest_version() {
+    local now ts ver
+    now="$(date +%s 2>/dev/null || echo 0)"
+
+    if [[ -f "${VERSION_CACHE}" ]]; then
+        IFS='|' read -r ts ver < "${VERSION_CACHE}" 2>/dev/null || true
+        if [[ "${ts}" =~ ^[0-9]+$ ]] && (( now - ts < VERSION_CACHE_TTL )); then
+            [[ -n "${ver}" ]] && { echo "${ver}"; return 0; }
+            # 缓存里记的是"取不到", 在 TTL 内不再重试, 避免每次进菜单都卡
+            [[ "${ts}" != "0" ]] && return 1
+        fi
+    fi
+
+    # 缓存过期/不存在: 联网取。只取版本行, 用 head 限制读取量
+    ver=""
+    if command -v curl >/dev/null 2>&1; then
+        ver="$(curl -fsSL --max-time 8 "${SELF_UPDATE_URL}" 2>/dev/null \
+            | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2)"
+    fi
+    if [[ -z "${ver}" ]] && command -v wget >/dev/null 2>&1; then
+        ver="$(wget -qO- --timeout=8 "${SELF_UPDATE_URL}" 2>/dev/null \
+            | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2)"
+    fi
+
+    # 写缓存 (含失败标记 0, 避免网络不通时反复重试拖慢菜单)
+    mkdir -p "${V2RAY_CONF_DIR}" 2>/dev/null || true
+    if [[ -n "${ver}" ]]; then
+        echo "${now}|${ver}" > "${VERSION_CACHE}" 2>/dev/null || true
+        echo "${ver}"
+        return 0
+    else
+        echo "${now}|" > "${VERSION_CACHE}" 2>/dev/null || true
+        return 1
+    fi
+}
+
+# 菜单头部的版本状态行: 本地版本 + 最新版本 + 状态标识
+show_version_line() {
+    local latest
+    latest="$(get_latest_version)"
+    if [[ -z "${latest}" ]]; then
+        # 取不到最新版本 (离线/GitHub 不可达): 只显示本地版本, 不误导
+        echo -e "${GREEN}  当前版本 v${SCRIPT_VERSION}  |  最新版本 检测失败(网络)${PLAIN}"
+        return 0
+    fi
+    if version_gt "${latest}" "${SCRIPT_VERSION}"; then
+        echo -e "${GREEN}  当前版本 v${SCRIPT_VERSION}  |  最新版本 v${latest}  ${RED}🔴 建议更新(菜单14)${PLAIN}"
+    elif version_gt "${SCRIPT_VERSION}" "${latest}"; then
+        # 本地比远端新 (开发版/刚提交未同步): 不提示更新
+        echo -e "${GREEN}  当前版本 v${SCRIPT_VERSION}  |  最新版本 v${latest}  🟢 本地为较新版本${PLAIN}"
+    else
+        echo -e "${GREEN}  当前版本 v${SCRIPT_VERSION}  |  最新版本 v${latest}  🟢 无需更新${PLAIN}"
+    fi
+}
+
 # 从 GitHub 下载最新脚本覆盖本地: 校验通过才替换, 失败保留原脚本
 do_self_update() {
     check_root
@@ -3864,6 +3948,8 @@ do_self_update() {
     if mv -f "${tmp}" "${self_path}" && chmod +x "${self_path}"; then
         rm -f "${self_path}.bak.$$"
         log_info "更新完成: v${SCRIPT_VERSION} -> v${new_ver}。重新运行 bash ${self_path} 生效。"
+        # 清版本缓存: 否则菜单头仍显示旧的最新版本号
+        rm -f "${VERSION_CACHE}" 2>/dev/null || true
         # 新版脚本若有待执行迁移, 提示跑升级 (已装机器追平新配置)
         if bash -c "grep -q 'MIGRATIONS=' '${self_path}'" 2>/dev/null; then
             log_confirm "提示: 若本机已安装节点, 建议再运行一次菜单 15 (升级已装节点配置), 补齐新版脚本的配置变更。"
