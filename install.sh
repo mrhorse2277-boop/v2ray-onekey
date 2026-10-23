@@ -48,7 +48,7 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.5.1"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 
 CERT_DIR="/data"
@@ -122,6 +122,18 @@ log_info()    { echo -e "${GREEN}[信息]${PLAIN} $*"; }
 log_warn()    { echo -e "${YELLOW}[警告]${PLAIN} $*"; }
 log_error()   { echo -e "${RED}[错误]${PLAIN} $*"; }
 log_confirm() { echo -e "${BLUE}[提示]${PLAIN} $*"; }
+
+# --- 依赖清单 (启动检测与安装共用; 新增依赖必须同时加入此处与 AGENTS.md 门禁) ---
+# RUNTIME_DEPS: 脚本任何功能都可能用到, 缺失则降级或出错 (菜单 7/10/11/12/15 也要用)
+#   curl=公网IP与下载, openssl=证书/base64/TLS探测, ss=端口查重,
+#   timeout/shuf=超时与随机端口, od/base64=shortId与socks编码
+RUNTIME_DEPS="curl wget openssl ss timeout shuf od base64"
+# BASE_DEPS: 纯 shell 逻辑必需 (coreutils/文本工具), 缺失直接无法运行
+BASE_DEPS="awk sed grep cut tr head tail sort uniq cat mkdir rm mv cp chmod chgrp basename dirname readlink mktemp date find touch printf"
+# OPTIONAL_DEPS: 缺失仅功能降级, 不自动安装 (qrencode=二维码, socat=证书备用)
+OPTIONAL_DEPS="qrencode socat"
+# 启动依赖检查是否已执行过 (避免每次回菜单重复 apt-get)
+DEPS_CHECKED=0
 
 gen_random() { tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c "$1"; }
 
@@ -597,6 +609,226 @@ install_dependencies() {
     fi
 }
 
+# 启动阶段依赖检查: 在弹出主菜单之前执行, 保证菜单 7/10/11/12/15 等功能也可用。
+# 背景: 依赖安装原先只在 do_install (用户选安装项) 里触发, 菜单 7 等路径不经过它,
+# 在精简系统上会因缺 curl/openssl 而静默产出错误链接 (调用多带 2>/dev/null)。
+# 策略:
+#   - BASE_DEPS 缺失 -> 直接退出 (无这些根本无法运行)
+#   - RUNTIME_DEPS 缺失 -> 交互模式提示并确认后安装; 非交互直接装(不阻塞一键命令)
+#   - 装完仍缺 -> 明确警告哪些功能受影响, 但仍放行菜单 (用户至少要能看节点/卸载)
+#   - OPTIONAL_DEPS 缺失 -> 仅提示, 不安装
+#   - 只执行一次 (DEPS_CHECKED), 避免每次回菜单重复 apt-get
+ensure_runtime_deps() {
+    [[ "${DEPS_CHECKED}" == "1" ]] && return 0
+
+    local missing_base="" missing_rt="" missing_opt="" c
+    for c in ${BASE_DEPS}; do
+        command -v "${c}" >/dev/null 2>&1 || missing_base+="${c} "
+    done
+    for c in ${RUNTIME_DEPS}; do
+        command -v "${c}" >/dev/null 2>&1 || missing_rt+="${c} "
+    done
+    for c in ${OPTIONAL_DEPS}; do
+        command -v "${c}" >/dev/null 2>&1 || missing_opt+="${c} "
+    done
+
+    # 1) 基础工具缺失: 无法运行, 直接退出并给出手动安装建议
+    if [[ -n "${missing_base}" ]]; then
+        log_error "缺少基础命令: ${missing_base}"
+        log_error "这些是脚本运行的前提, 无法自动修复。请先安装 coreutils 与文本工具后重试。"
+        exit 1
+    fi
+
+    # 2) 运行时依赖缺失: 按发行版安装
+    if [[ -n "${missing_rt}" ]]; then
+        local pkgmgr=""
+        if command -v apt-get >/dev/null 2>&1; then pkgmgr="apt"
+        elif command -v dnf >/dev/null 2>&1; then pkgmgr="dnf"
+        elif command -v yum >/dev/null 2>&1; then pkgmgr="yum"
+        fi
+
+        if [[ -z "${pkgmgr}" ]]; then
+            log_warn "缺少: ${missing_rt}且系统无 apt-get/dnf/yum, 无法自动安装。"
+            log_warn "受影响功能: 菜单 7 链接生成(公网IP/base64)、REALITY 选站、端口查重、下载安装。"
+        else
+            log_warn "检测到缺失依赖: ${missing_rt}"
+            local do_install_now=1
+            if [[ -t 0 ]]; then
+                log_confirm "将使用 ${pkgmgr} 安装上述软件包, 这会修改系统已安装软件。"
+                local yn
+                read -rp "是否现在安装? [Y/n]: " yn
+                [[ "${yn,,}" == "n" ]] && do_install_now=0
+            fi
+            if [[ "${do_install_now}" == "1" ]]; then
+                install_runtime_deps "${pkgmgr}"
+                # 装完复核: 以命令是否真的可用为准, 不信包管理器的返回码
+                local still=""
+                for c in ${RUNTIME_DEPS}; do
+                    command -v "${c}" >/dev/null 2>&1 || still+="${c} "
+                done
+                if [[ -n "${still}" ]]; then
+                    log_error "依赖安装未完全成功, 仍缺少: ${still}"
+                    log_warn "已尝试: 索引刷新 -> 批量安装 -> --fix-missing 重试 -> 逐个安装。"
+                    log_warn "完整日志: /tmp/v2ray_deps_install.log"
+                    log_warn "请按上面的日志排查 (常见原因: 软件源不可达/被墙、源列表损坏、磁盘满)。"
+                    log_warn "可手动安装后重新运行本脚本, 例如:"
+                    case "${pkgmgr}" in
+                        apt) log_warn "  apt-get update && apt-get install -y ${still}" ;;
+                        *)   log_warn "  ${pkgmgr} install -y ${still}" ;;
+                    esac
+                    log_warn "受影响功能: 菜单 7 链接生成(公网IP/base64)、REALITY 选站、端口查重、下载安装。"
+                    log_warn "继续进入菜单, 但上述功能可能异常。"
+                else
+                    log_info "运行时依赖已就绪。"
+                fi
+            else
+                log_warn "已跳过依赖安装 (你选择了 n)。缺失 ${missing_rt}可能导致部分功能异常。"
+                log_warn "需要时可重新运行本脚本, 或手动安装:"
+                case "${pkgmgr}" in
+                    apt) log_warn "  apt-get install -y ${missing_rt}" ;;
+                    *)   log_warn "  ${pkgmgr} install -y ${missing_rt}" ;;
+                esac
+            fi
+        fi
+    fi
+
+    # 3) 可选依赖: 只提示
+    if [[ -n "${missing_opt}" ]]; then
+        log_warn "可选组件缺失: ${missing_opt} (不影响核心功能)"
+        case "${missing_opt}" in
+            *qrencode*) log_warn "  - qrencode: 不显示二维码, 分享链接仍正常输出" ;;
+        esac
+        case "${missing_opt}" in
+            *socat*) log_warn "  - socat: 证书申请备用方案不可用" ;;
+        esac
+    fi
+
+    DEPS_CHECKED=1
+    return 0
+}
+
+# 按包管理器安装运行时依赖 (只装缺失的, 不整包重装)
+# 按包管理器安装运行时依赖 (只装缺失的)。
+# 设计原则: 尽力保障装成功, 不静默跳过。已覆盖的最差情况:
+#   1. apt 索引损坏/不同步 -> update 后仍失败, 用 --fix-missing 重试
+#   2. 某个包在源里不可用   -> 逐个安装, 不让一个包拖垮整批
+#   3. 软件源不可达/被墙     -> 记录日志并明确报错, 给出手动命令, 不假装成功
+#   4. apt/dpkg 被其他进程占用 -> 先等锁 (最多 60s), 超时则提示而不是干等
+#   5. 命令挂死(网络黑洞)     -> 所有 apt/dnf 调用套 timeout, 避免卡死菜单
+#   6. 磁盘不足               -> 安装前检查, 空间不够直接说明而不是装到一半失败
+#   7. 半装状态(dpkg interrupted) -> 尝试 dpkg --configure -a 修复后重试
+# 返回 0 表示"已尽力", 是否真的可用由调用方 command -v 复核。
+install_runtime_deps() {
+    local pkgmgr="$1" pkgs="" c
+    for c in ${RUNTIME_DEPS}; do
+        command -v "${c}" >/dev/null 2>&1 && continue
+        case "${c}" in
+            ss)     pkgs+="iproute2 " ;;
+            base64|od) pkgs+="coreutils " ;;
+            *)      pkgs+="${c} " ;;
+        esac
+    done
+    pkgs="$(printf '%s\n' ${pkgs} | sort -u | tr '\n' ' ')"
+    [[ -z "${pkgs// /}" ]] && return 0
+
+    local logf="/tmp/v2ray_deps_install.log"
+    : > "${logf}" 2>/dev/null || logf="/dev/null"
+    _dep_log() { echo "[$(date '+%H:%M:%S')] $*" >> "${logf}" 2>/dev/null; }
+
+    log_info "安装: ${pkgs}"
+
+    # 最差情况 6: 磁盘空间 (装这些包约需 30-60MB, 留 100MB 余量)
+    local avail_mb
+    avail_mb="$(df -Pm / | tail -1 | awk '{print $4}' 2>/dev/null)"
+    if [[ "${avail_mb}" =~ ^[0-9]+$ ]] && (( avail_mb < 100 )); then
+        log_error "磁盘剩余 ${avail_mb}MB, 不足以安装依赖 (需至少 100MB)。"
+        log_warn "请清理空间后重新运行本脚本。"
+        return 1
+    fi
+
+    # 最差情况 4: dpkg 锁被占用 (unattended-upgrades / 用户手动 apt 常见)
+    _wait_dpkg_lock() {
+        [[ "${pkgmgr}" == "apt" ]] || return 0
+        local i
+        for i in $(seq 1 30); do
+            if ! fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock >/dev/null 2>&1; then
+                return 0
+            fi
+            [[ "${i}" == "1" ]] && log_warn "apt/dpkg 被其他进程占用, 等待锁释放 (最多 60s)..."
+            sleep 2
+        done
+        log_warn "等待 dpkg 锁超时。可能有 apt 正在运行 (如自动更新), 请稍后重试。"
+        _dep_log "dpkg lock timeout"
+        return 1
+    }
+
+    # 所有包管理调用统一套 timeout (最差情况 5: 网络黑洞导致挂死)
+    _pkg_run() {
+        local secs="$1"; shift
+        timeout "${secs}" "$@" >>"${logf}" 2>&1
+    }
+
+    case "${pkgmgr}" in
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            _wait_dpkg_lock || { log_warn "跳过安装 (锁未释放)。"; return 1; }
+
+            # 最差情况 7: 上次安装中断留下的半装状态
+            if [[ -f /var/lib/dpkg/updates/0000 ]] || dpkg --audit 2>/dev/null | grep -q .; then
+                log_warn "检测到 dpkg 半装状态, 先修复..."
+                _dep_log "dpkg --configure -a"
+                _pkg_run 120 dpkg --configure -a || true
+            fi
+
+            # 1) 刷新索引 (失败继续用现有索引)
+            _dep_log "apt-get update"
+            if ! _pkg_run 180 apt-get update -y; then
+                log_warn "apt 索引刷新失败, 用现有索引继续。"
+                _dep_log "update failed, continue"
+            fi
+
+            # 2) 批量安装
+            # shellcheck disable=SC2086
+            if _pkg_run 300 apt-get install -y --no-install-recommends ${pkgs}; then
+                _dep_log "batch install OK"
+            else
+                log_warn "批量安装失败, 尝试 --fix-missing 修复..."
+                _dep_log "retry --fix-missing"
+                # shellcheck disable=SC2086
+                if _pkg_run 300 apt-get install -y --fix-missing --no-install-recommends ${pkgs}; then
+                    _dep_log "fix-missing OK"
+                else
+                    log_warn "修复重试仍失败, 改为逐个安装..."
+                    local one
+                    for one in ${pkgs}; do
+                        _dep_log "single: ${one}"
+                        _pkg_run 180 apt-get install -y --no-install-recommends "${one}" \
+                            || _dep_log "single failed: ${one}"
+                    done
+                fi
+            fi
+            ;;
+        dnf|yum)
+            _dep_log "${pkgmgr}: epel"
+            _pkg_run 120 "${pkgmgr}" install -y epel-release || true
+            _dep_log "${pkgmgr} install ${pkgs}"
+            # shellcheck disable=SC2086
+            if _pkg_run 300 "${pkgmgr}" install -y ${pkgs}; then
+                _dep_log "batch OK"
+            else
+                log_warn "批量安装失败, 改为逐个安装..."
+                local one
+                for one in ${pkgs}; do
+                    _dep_log "single: ${one}"
+                    _pkg_run 180 "${pkgmgr}" install -y "${one}" \
+                        || _dep_log "single failed: ${one}"
+                done
+            fi
+            ;;
+    esac
+    return 0
+}
+
 # 探测系统现有 Nginx 环境 (宝塔面板 / 发行版 Nginx / 全新系统)
 # 结果写入 NGINX_ENV / NGINX_BIN / NGINX_VHOST_DIR / NGINX_RELOAD_CMD / WS_NGINX_CONF
 # 场景: 先用本脚本装过 ws (配置在发行版 nginx), 之后装了宝塔 —— 旧配置位于
@@ -761,9 +993,18 @@ open_firewall() {
 
 get_public_ip() {
     local ip=""
-    ip="$(curl -4 -s --max-time 8 https://api.ip.sb/ip || true)"
-    [[ -z "${ip}" ]] && ip="$(curl -4 -s --max-time 8 https://ifconfig.me || true)"
-    [[ -z "${ip}" ]] && ip="$(curl -4 -s --max-time 8 https://api.ipify.org || true)"
+    # curl 缺失时 (依赖安装失败且用户选择继续) 优雅降级: 用 wget 兜底,
+    # 两者都没有就留空, 由调用方用 127.0.0.1 占位并提示, 不刷屏报错
+    if command -v curl >/dev/null 2>&1; then
+        ip="$(curl -4 -s --max-time 8 https://api.ip.sb/ip || true)"
+        [[ -z "${ip}" ]] && ip="$(curl -4 -s --max-time 8 https://ifconfig.me || true)"
+        [[ -z "${ip}" ]] && ip="$(curl -4 -s --max-time 8 https://api.ipify.org || true)"
+    elif command -v wget >/dev/null 2>&1; then
+        ip="$(wget -4 -qO- --timeout=8 https://api.ip.sb/ip 2>/dev/null || true)"
+        [[ -z "${ip}" ]] && ip="$(wget -4 -qO- --timeout=8 https://api.ipify.org 2>/dev/null || true)"
+    else
+        log_warn "curl/wget 均不可用, 无法获取公网 IP (链接将用 127.0.0.1 占位)。"
+    fi
     PUBLIC_IP="${ip//[$'\r\n']/}"
 }
 
@@ -3274,14 +3515,14 @@ do_update_v2ray() {
 # ---------- 安装流程调度 ----------
 
 do_install() {
-    check_root
-    check_system
-    # 未真机验证的系列 (RHEL 系) 在交互模式下要求确认, 非交互下只保留警告
+    # check_root / check_system / 依赖补齐已在 main() 入口完成 (含非交互路径),
+    # 这里只做安装专属的检查: 未验证发行版确认 + 深度预检 + 安装完整依赖集。
     if ! confirm_untested_distro; then
         log_info "已取消安装。"
         exit 0
     fi
     preflight_check
+    # 启动阶段只装了 RUNTIME_DEPS; 安装还需要 qrencode/socat/cron 等完整集合
     install_dependencies
 
     case "${MODE}" in
@@ -3637,6 +3878,13 @@ do_self_update() {
 }
 
 main() {
+    # 启动即做环境检查与依赖补齐, 保证主菜单弹出时环境已就绪。
+    # 原先这些只在 do_install 里做, 导致菜单 7/10/11/12/15 在精简系统上
+    # 因缺 curl/openssl 而静默出错 (调用多带 2>/dev/null, 用户看不到失败)。
+    check_root
+    check_system
+    ensure_runtime_deps
+
     # 非交互入口: install.sh <ws|xhttp|socks|reality> [vmess|vless]
     # h2 作为旧参数名保留为别名 (历史文档/用户脚本里可能还在用), 统一映射到 xhttp
     if [[ -n "${1:-}" ]]; then

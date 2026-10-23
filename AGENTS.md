@@ -66,7 +66,44 @@ raw 拉取源,**没有版本分支/tag 隔离**:
 - 新增/修改包管理器分支、用户组/权限/SELinux/防火墙逻辑
 - 升级或改变 core(v2ray/xray)的安装方式、配置模板结构
 - 改动迁移机制(`MIGRATIONS`)本身
+- 改动启动依赖检测(`ensure_runtime_deps` / `install_runtime_deps`)
 - 拿不准时按 A 档算
+
+### 新增依赖的强制流程(缺一不可)
+
+脚本在**主菜单弹出前**做依赖检测与补齐(`main()` → `ensure_runtime_deps`)。
+以后任何新增依赖都必须走完下面四步, 否则等于给用户埋一个静默失败:
+
+1. **加入清单**:按性质放进 `install.sh` 顶部的 `RUNTIME_DEPS`(任何功能都可能用到,
+   缺失会降级或出错)或 `OPTIONAL_DEPS`(缺失仅功能降级、不自动安装)。
+   `BASE_DEPS` 只放"没有就无法运行"的核心命令(coreutils/文本工具), 不要往里塞新东西。
+2. **同步能力基线**:在本文第 3 节"依赖能力基线"表里补一行(依赖名 + 用到的能力 +
+   最低版本 + 已验证范围), 否则后人无法判断版本升级是否需要重测。
+3. **跑六系统全矩阵**(第 4 节), 且必须额外验证**新依赖缺失时的启动路径**:
+   在最小化环境里确认"检测到缺失 → 安装 → 复核 → 继续"这条链路走得通。
+4. **在 MAINTENANCE 的"依赖能力复核记录"里记一行**。
+
+**为什么必须这么严**:菜单 7/10/11/12/15 这些功能不经过 `do_install`,
+如果依赖只装在安装路径上, 精简系统上跑菜单 7 会因缺 `curl`/`openssl` 而
+**静默产出错误链接**(相关调用大多带 `2>/dev/null`), 用户看到的链接格式正确但内容是错的。
+2026-10 就踩过这个坑。
+
+### 依赖安装的健壮性要求
+
+`install_runtime_deps` 必须覆盖这些最差情况, 修改时不许退化:
+
+| 最差情况 | 处理方式 |
+|---|---|
+| apt 索引损坏/不同步 | `update` 后仍失败 → `--fix-missing` 重试 |
+| 某个包源里不可用 | 逐个包安装, 不让一个包拖垮整批 |
+| 软件源不可达/被墙 | 记录日志 + 明确报错 + 给出手动命令, **不许假装成功** |
+| dpkg 锁被占用 | 等待释放(最多 60s), 超时明确提示而不是干等 |
+| 命令挂死(网络黑洞) | 所有包管理调用套 `timeout` |
+| 磁盘不足 | 安装前检查, 不足直接说明 |
+| dpkg 半装状态 | `dpkg --configure -a` 修复后重试 |
+
+安装结果**以 `command -v` 复核为准**, 不信包管理器的返回码。
+失败后允许继续进菜单(用户至少要能看节点/卸载), 但必须明确告知哪些功能受影响。
 
 ### 不需要跑全矩阵的情形
 
@@ -135,7 +172,11 @@ systemd-run --machine=tXX --quiet --pipe --wait /bin/sh -c 'systemctl is-system-
 - 宿主机 debootstrap 1.0.128 不认识 `noble`(实测 `E: No such script`):
   先 `cp /usr/share/debootstrap/scripts/jammy /usr/share/debootstrap/scripts/noble`
   再 `sed -i 's/jammy/noble/g'` 改名; Ubuntu 系结构相同, 引导正常
-- Ubuntu 容器内 systemd-resolved 起不来: disable 掉并写静态 resolv.conf
+- Ubuntu 容器内 systemd-resolved 起不来: disable 掉并写静态 resolv.conf。
+  **注意**: 若在 nspawn 启动后才改 resolv.conf, resolved 可能再次覆盖, 导致
+  `Temporary failure resolving` 让依赖安装假失败(2026-10 实测踩过)。做法:
+  启动容器后立即 `systemctl disable --now systemd-resolved` 再写文件,
+  或写入后 `chattr +i` 锁定(测试完记得 `chattr -i` 再删目录)
 
 **测试后必须清理**:`machinectl terminate` 所有机器、删掉 `/tmp/ns_*`、
 移除临时加的 debootstrap 脚本, 确认宿主机磁盘与服务恢复原状。
