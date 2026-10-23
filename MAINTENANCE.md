@@ -187,6 +187,9 @@ systemd-run --machine=t11 --quiet --pipe --wait /bin/bash -c 'systemctl is-syste
   `"版本|函数|描述"` 并实现幂等迁移函数(先检测字段已存在则跳过),存量机器跑一次
   菜单 15 就追平;已应用记录在 `MIGRATIONS_STATE`
   (`/usr/local/etc/v2ray/migrations_done.txt`,格式 `版本|函数名`),失败自动回滚不记 state。
+  **同时必须写 `<函数名>_check` 只读探针**(AGENTS.md 第 5 节, 硬性):菜单头部的
+  "🔴 N 条待升级"靠探针判定, 不读 state 文件。探针只读、幂等, 已迁移返回 1,
+  未迁移/半迁移返回 0; 漏写会静默退回 state 判定并丢掉"全新安装免误报"能力。
   **注意跨文件迁移的特殊性**:执行器默认要求目标配置已存在(否则 continue),
   但 h2→xhttp 的源是 `config_h2.json`、目标是尚不存在的 `config_xhttp.json`,
   所以执行器对 `migr_h2_to_xhttp` 特判放行源文件,且目标不存在时不备份(回滚靠删新文件)。
