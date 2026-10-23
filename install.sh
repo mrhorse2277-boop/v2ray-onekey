@@ -3888,22 +3888,45 @@ get_latest_version() {
     fi
 }
 
+# 读取磁盘上脚本文件的当前版本号 (与内存里的 SCRIPT_VERSION 可能不同)。
+# 场景: 菜单 14 更新了文件, 但当前进程仍是旧版; 或用户手动替换了脚本。
+# 以磁盘为准才能反映"用户实际拥有的版本", 否则会一直显示旧版本号。
+get_disk_script_version() {
+    local self_path ver
+    self_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    [[ -f "${self_path}" ]] || { echo "${SCRIPT_VERSION}"; return 0; }
+    ver="$(grep -m1 '^SCRIPT_VERSION=' "${self_path}" 2>/dev/null | cut -d'"' -f2)"
+    if [[ -n "${ver}" ]]; then
+        echo "${ver}"
+    else
+        echo "${SCRIPT_VERSION}"
+    fi
+}
+
 # 菜单头部的版本状态行: 本地版本 + 最新版本 + 状态标识
 show_version_line() {
-    local latest
+    local latest local_ver
+    local_ver="$(get_disk_script_version)"
     latest="$(get_latest_version)"
+
+    # 磁盘版本与运行中版本不一致: 说明脚本已被更新, 当前进程还是旧的
+    local pending_note=""
+    if [[ "${local_ver}" != "${SCRIPT_VERSION}" ]]; then
+        pending_note="  (脚本已更新至 v${local_ver}, 重新运行生效)"
+    fi
+
     if [[ -z "${latest}" ]]; then
         # 取不到最新版本 (离线/GitHub 不可达): 只显示本地版本, 不误导
-        echo -e "${GREEN}  当前版本 v${SCRIPT_VERSION}  |  最新版本 检测失败(网络)${PLAIN}"
+        echo -e "${GREEN}  当前版本 v${local_ver}  |  最新版本 检测失败(网络)${pending_note}${PLAIN}"
         return 0
     fi
-    if version_gt "${latest}" "${SCRIPT_VERSION}"; then
-        echo -e "${GREEN}  当前版本 v${SCRIPT_VERSION}  |  最新版本 v${latest}  ${RED}🔴 建议更新(菜单14)${PLAIN}"
-    elif version_gt "${SCRIPT_VERSION}" "${latest}"; then
-        # 本地比远端新 (开发版/刚提交未同步): 不提示更新
-        echo -e "${GREEN}  当前版本 v${SCRIPT_VERSION}  |  最新版本 v${latest}  🟢 本地为较新版本${PLAIN}"
+    if version_gt "${latest}" "${local_ver}"; then
+        echo -e "${GREEN}  当前版本 v${local_ver}  |  最新版本 v${latest}  ${RED}🔴 建议更新(菜单14)${PLAIN}${pending_note}"
+    elif version_gt "${local_ver}" "${latest}"; then
+        # 本地比远端新 (开发版/刚提交未同步, 或 CDN 尚未刷新): 不提示更新
+        echo -e "${GREEN}  当前版本 v${local_ver}  |  最新版本 v${latest}  🟢 本地为较新版本${PLAIN}${pending_note}"
     else
-        echo -e "${GREEN}  当前版本 v${SCRIPT_VERSION}  |  最新版本 v${latest}  🟢 无需更新${PLAIN}"
+        echo -e "${GREEN}  当前版本 v${local_ver}  |  最新版本 v${latest}  🟢 无需更新${PLAIN}${pending_note}"
     fi
 }
 
@@ -3948,8 +3971,11 @@ do_self_update() {
     if mv -f "${tmp}" "${self_path}" && chmod +x "${self_path}"; then
         rm -f "${self_path}.bak.$$"
         log_info "更新完成: v${SCRIPT_VERSION} -> v${new_ver}。重新运行 bash ${self_path} 生效。"
-        # 清版本缓存: 否则菜单头仍显示旧的最新版本号
-        rm -f "${VERSION_CACHE}" 2>/dev/null || true
+        # 版本缓存直接写入刚更新到的版本号, 而不是删除:
+        # GitHub raw 的 CDN 有几分钟延迟, 若清缓存后立刻联网, 可能又取回旧版本,
+        # 导致"刚更新完又提示要更新"的困惑。写入新版本号可保证状态一致。
+        mkdir -p "${V2RAY_CONF_DIR}" 2>/dev/null || true
+        echo "$(date +%s)|${new_ver}" > "${VERSION_CACHE}" 2>/dev/null || true
         # 新版脚本若有待执行迁移, 提示跑升级 (已装机器追平新配置)
         if bash -c "grep -q 'MIGRATIONS=' '${self_path}'" 2>/dev/null; then
             log_confirm "提示: 若本机已安装节点, 建议再运行一次菜单 15 (升级已装节点配置), 补齐新版脚本的配置变更。"
