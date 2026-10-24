@@ -54,12 +54,20 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.6.1"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 # 最新版本号缓存: 菜单每次刷新都联网会很慢 (尤其 GitHub 被墙时), 缓存 6 小时
 # 格式: "<时间戳>|<版本号>" ; 取不到版本时写 "0|" 表示未知
 VERSION_CACHE="${V2RAY_CONF_DIR}/latest_version.cache"
 VERSION_CACHE_TTL=21600   # 6 小时
+
+# --- REALITY 伪装站健康缓存 (菜单头部状态行) ---
+# 巡检逻辑与菜单 16 (do_reality_dest_check) 同源。菜单每次刷新都做 TLS 握手
+# +GFW 列表+延迟探测会拖慢 2-5s, 因此结果缓存 6 小时, 过期才重新探测;
+# 菜单 16 手动巡检、菜单 10 换站成功、REALITY 安装成功后立即写缓存。
+# 格式: "<时间戳>|<ok|gfw|tls>"
+REALITY_HEALTH_CACHE="${V2RAY_CONF_DIR}/reality_dest_health.cache"
+REALITY_HEALTH_TTL=21600   # 6 小时
 
 CERT_DIR="/data"
 CRT_FILE="${CERT_DIR}/v2ray.crt"
@@ -2469,6 +2477,7 @@ do_install_reality() {
     fi
 
     show_mode_info
+    write_reality_health_cache ok
     log_confirm "vless + REALITY 安装完成 (端口: ${REALITY_PORT},请在防火墙/安全组放行)。"
     log_confirm "REALITY 无需域名与证书,当前为抗封锁能力最强的模式。"
 }
@@ -3076,6 +3085,7 @@ do_uninstall() {
             ;;
         4)
             unrecord_ports_in_file "${REALITY_CONF}"
+            rm -f "${REALITY_HEALTH_CACHE}" 2>/dev/null
             stop_service_sync "${REALITY_SERVICE}"
             systemctl disable "${REALITY_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${REALITY_SERVICE}.service" "${REALITY_CONF}"
@@ -3676,6 +3686,8 @@ do_change_reality_dest() {
     echo -e " 新伪装站 : ${REALITY_DEST}"
     echo -e " 新链接   : ${new_url}"
     echo -e "${GREEN}==========================================${PLAIN}"
+    # 换站终验已通过, 头部状态行直接记健康 (下次过期再自动复检)
+    write_reality_health_cache ok
     show_qr "${new_url}"
     log_confirm "客户端只需把该节点的 SNI 改为 ${REALITY_SNI} (或删旧导新上面的链接)。"
     log_confirm "同时请更新本地直连验证: 你所在网络需能正常访问 ${REALITY_SNI}。"
@@ -3723,10 +3735,19 @@ do_reality_dest_check() {
     echo -e "${GREEN}=====================================================${PLAIN}"
     if [[ "${tls_ok}" == "1" && "${gfw_hit}" == "0" ]]; then
         log_confirm "巡检结论: 🟢 伪装站健康, 无需处理。"
+        write_reality_health_cache ok
+        log_confirm "菜单头部状态行已同步为 🟢 (结论缓存 6 小时, 也可等过期自动复检)。"
         return 0
     fi
-    log_warn "巡检结论: 🔴 伪装站劣化 (TLS 不达标或已进 GFW 列表)。"
-    log_warn "建议尽快运行菜单 10 更换伪装站 (保留 UUID/端口/密钥, 客户端只改 SNI)。"
+    if [[ "${gfw_hit}" == "1" ]]; then
+        log_warn "巡检结论: 🔴 伪装站已进 GFW 封锁列表 (作 SNI 会被选择性阻断)。"
+        log_warn "建议尽快运行菜单 10 更换伪装站 (保留 UUID/端口/密钥, 客户端只改 SNI)。"
+        write_reality_health_cache gfw
+    else
+        log_warn "巡检结论: 🔴 伪装站 TLS1.3+H2 不达标 (站点证书/协议/可达性变化, 或本机网络问题)。"
+        log_warn "本机网络正常且复查仍不达标时, 运行菜单 10 更换伪装站。"
+        write_reality_health_cache tls
+    fi
     return 1
 }
 
@@ -4295,6 +4316,48 @@ show_core_version_line() {
     fi
 }
 
+# --- REALITY 伪装站健康 (菜单头部状态行, 与菜单 16 同源判定) ---
+# 快速巡检: 不打印明细, 只输出状态字 ok(健康)/gfw(进封锁列表)/tls(握手不达标)。
+# 区分 gfw 与 tls: gfw 命中是确定的"该换", tls 失败可能是站点变化也可能是本机
+# 网络问题, 头部只提示复查, 由菜单 16 的明细判定。
+reality_dest_health_status() {
+    local dest sni
+    dest="$(grep -o '"dest": "[^"]*"' "${REALITY_CONF}" 2>/dev/null | head -1 | cut -d'"' -f4)"
+    sni="$(grep -A1 '"serverNames"' "${REALITY_CONF}" 2>/dev/null | grep -o '"[^"]*"' | sed -n 2p | tr -d '"')"
+    [[ -z "${sni}" ]] && sni="${dest%%:*}"
+    [[ -n "${dest}" ]] || return 1
+    local tls_ok=0 gfw_hit=0
+    check_reality_dest "${dest}" "${sni}" && tls_ok=1
+    check_gfw_list "${sni}" && gfw_hit=1
+    if (( tls_ok && !gfw_hit )); then echo ok
+    elif (( gfw_hit )); then echo gfw
+    else echo tls
+    fi
+}
+
+# 读缓存 (未过期直接用), 过期则探测一次并写缓存; 输出 ok|gfw|tls, 取不到输出空
+get_reality_dest_health() {
+    local now ts st
+    now="$(date +%s 2>/dev/null || echo 0)"
+    if [[ -f "${REALITY_HEALTH_CACHE}" ]]; then
+        IFS='|' read -r ts st < "${REALITY_HEALTH_CACHE}" 2>/dev/null || true
+        if [[ "${ts}" =~ ^[0-9]+$ ]] && (( now - ts < REALITY_HEALTH_TTL )) && [[ -n "${st}" ]]; then
+            echo "${st}"
+            return 0
+        fi
+    fi
+    st="$(reality_dest_health_status 2>/dev/null || true)"
+    mkdir -p "${V2RAY_CONF_DIR}" 2>/dev/null || true
+    echo "${now}|${st:-unknown}" > "${REALITY_HEALTH_CACHE}" 2>/dev/null || true
+    if [[ -n "${st}" ]]; then echo "${st}"; else return 1; fi
+}
+
+# 主动写缓存: 菜单 16 巡检后 / 菜单 10 换站成功 / REALITY 安装成功
+write_reality_health_cache() {
+    mkdir -p "${V2RAY_CONF_DIR}" 2>/dev/null || true
+    echo "$(date +%s 2>/dev/null || echo 0)|${1:-ok}" > "${REALITY_HEALTH_CACHE}" 2>/dev/null || true
+}
+
 # 菜单头部的状态区: 脚本版本 / 节点配置各一行, 已安装的 core 内核再加行。
 # "版本对 + 状态" 合并到一行, 宽度都在边框内 (≤52 列):
 #   脚本版本 : v1.5.2 → v1.5.3  🔴 建议更新 (菜单 14)
@@ -4342,6 +4405,22 @@ show_version_line() {
     # 内核版本: 只对已安装的 core 各显示一行 (未装该 core 不显示)
     show_core_version_line "Xray内核" "/usr/local/bin/xray" "XTLS/Xray-core"
     show_core_version_line "V2Ray内核" "/usr/local/bin/v2ray" "v2fly/v2ray-core"
+
+    # REALITY 伪装站健康: 已装 REALITY 才显示; 结果缓存 6 小时 (菜单 16 强制刷新)
+    if [[ -f "${REALITY_CONF}" ]]; then
+        local rdest rst
+        rdest="$(grep -o '"dest": "[^"]*"' "${REALITY_CONF}" 2>/dev/null | head -1 | cut -d'"' -f4 | awk -F: '{print $1}')"
+        rst="$(get_reality_dest_health)"
+        # 域名过长截断, 保证整行不超边框 52 列
+        (( ${#rdest} > 18 )) && rdest="${rdest:0:17}…"
+        if [[ "${rst}" == "ok" ]]; then
+            echo -e "${GREEN}  伪装站   : ${rdest}  🟢 健康${PLAIN}"
+        elif [[ "${rst}" == "gfw" ]]; then
+            echo -e "${GREEN}  伪装站   : ${rdest} ${RED}🔴 建议换站 (菜单 10)${GREEN}${PLAIN}"
+        else
+            echo -e "${GREEN}  伪装站   : ${rdest}  ${YELLOW}🔴 待复查 (菜单 16)${GREEN}${PLAIN}"
+        fi
+    fi
 
     # 磁盘已更新但当前进程仍是旧版: 单独一行提示
     if [[ "${local_ver}" != "${SCRIPT_VERSION}" ]]; then
