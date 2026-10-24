@@ -189,8 +189,18 @@ bash install.sh reality && bash install.sh ws vless && bash install.sh socks
 
 ### ws 模式走 Cloudflare CDN 中转(1.6.0 起)
 
-ws+tls 模式支持域名解析到 Cloudflare(橙云代理)的 CDN 中转部署,安装时
-**自动识别**(域名解析落在 CF 公布的 IP 段内即切换该模式),无需手工选:
+ws+tls 模式支持域名解析到 Cloudflare(橙云代理)的 CDN 中转部署。**选择入口在
+安装 ws 的流程里**(菜单 1/2 或一键命令),不是独立菜单项:
+
+- **交互安装**:输入域名后,脚本检测到解析落在 CF 公布的 IP 段,会**明确询问
+  "启用 CDN 中转模式? [Y/n]"**,回车默认启用;选 n 按直连继续(会提示灰云/
+  证书风险)
+- **非交互一键命令**:检测到 CF 解析自动启用;`CF_MODE=1` 可**强制启用**——
+  适合域名暂时灰云直连、证书签好后再开橙云的场景
+- xhttp 模式检测到 CF 解析会明确提示**不支持 CDN 中转**(CF 代理的缓冲会破坏
+  xhttp 流式传输),需要 CDN 请用 ws 模式
+
+启用后:
 
 - 流量路径:客户端 → CF 边缘 → 回源本机 443(nginx),VPS 真实 IP 不直接暴露
 - 证书签发改走 **DNS-01**(`acme.sh` 的 `dns_cf`),不需要 80 端口可达:

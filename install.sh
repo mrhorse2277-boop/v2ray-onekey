@@ -54,7 +54,7 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.6.1"
+SCRIPT_VERSION="1.6.2"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 # 最新版本号缓存: 菜单每次刷新都联网会很慢 (尤其 GitHub 被墙时), 缓存 6 小时
 # 格式: "<时间戳>|<版本号>" ; 取不到版本时写 "0|" 表示未知
@@ -115,8 +115,9 @@ URL_FILE="/root/v2ray_share_url.txt"
 
 # DOMAIN 支持环境变量预设 (非交互安装), 交互模式下仍会提示输入
 DOMAIN="${DOMAIN:-}"
-# CDN 中转模式 (域名解析落在 CF IP 段时 check_domain 置 1): 证书走 DNS-01
-CF_MODE=0
+# CDN 中转模式 (域名解析落在 CF IP 段时 check_domain 置 1): 证书走 DNS-01。
+# 也可用环境变量 CF_MODE=1 强制启用 (域名暂时灰云直连、稍后再开橙云的场景)
+CF_MODE="${CF_MODE:-0}"
 MODE=""                 # ws | xhttp | socks | reality
 PROTOCOL=""             # vmess | vless (socks/reality 模式下为空/固定)
 UUID=""
@@ -1670,10 +1671,13 @@ EOF
 
 do_install_ws() {
     echo
+    # CF_MODE 环境变量预设仅对本次安装生效; 清零防止菜单连续安装时上一次的状态泄漏
+    local cf_preset="${CF_MODE:-0}"
+    CF_MODE=0
     if [[ -n "${DOMAIN}" ]]; then
         log_info "使用预设域名 (环境变量 DOMAIN): ${DOMAIN}"
     else
-        log_confirm "请输入你的域名 (例如 www.example.com,必须已解析 A 记录到本机):"
+        log_confirm "请输入你的域名 (已解析 A 记录到本机; 解析到 Cloudflare 可走 CDN 中转):"
         read -rp "域名: " DOMAIN
     fi
     DOMAIN="${DOMAIN//[$'\r\n']/}"
@@ -1681,6 +1685,22 @@ do_install_ws() {
     if [[ -z "${DOMAIN}" ]] || ! check_domain "${DOMAIN}"; then
         log_error "域名校验未通过。"
         exit 1
+    fi
+    [[ "${cf_preset}" == "1" ]] && CF_MODE=1   # 环境变量强制 (灰云预备切换场景)
+
+    # CDN 中转模式选择: 检测到 CF 解析 (或环境变量强制) 时明确询问;
+    # 非交互 (一键命令) 默认启用。选 n 时按直连继续并提示证书风险。
+    if [[ "${CF_MODE}" == "1" && -t 0 ]]; then
+        log_confirm "检测到该域名可走 Cloudflare CDN 中转:"
+        log_confirm "  - 流量经 CF 边缘回源本机 443, 客户端看不到 VPS 真实 IP"
+        log_confirm "  - 证书签发走 DNS-01, 需要 CF API Token (或自备证书)"
+        local yn
+        read -rp "启用 CDN 中转模式? [Y/n]: " yn
+        if [[ "${yn,,}" == "n" ]]; then
+            CF_MODE=0
+            log_warn "已按直连模式继续。该域名当前解析到 Cloudflare, 80 端口 HTTP-01 证书申请大概率失败;"
+            log_warn "建议在 CF 面板把该记录改为\"仅 DNS\"(灰云)后重试, 或自备证书到 /data/v2ray.crt|key。"
+        fi
     fi
 
     # 探测现有 Nginx 环境 (宝塔/发行版/全新), 并做域名占用防误伤检查
@@ -1888,6 +1908,7 @@ EOF
 
 do_install_xhttp() {
     echo
+    CF_MODE=0   # xhttp 不支持 CDN 中转, 防止菜单流程中上一次 ws 安装的状态泄漏
     if [[ -n "${DOMAIN}" ]]; then
         log_info "使用预设域名 (环境变量 DOMAIN): ${DOMAIN}"
     else
@@ -1899,6 +1920,14 @@ do_install_xhttp() {
     if [[ -z "${DOMAIN}" ]] || ! check_domain "${DOMAIN}"; then
         log_error "域名校验未通过。"
         exit 1
+    fi
+    # check_domain 检测到 CF 解析会置 CF_MODE=1, 但 xhttp 走 CF 代理会被其
+    # 缓冲/流处理破坏, 明确告知不支持并按直连处理 (证书仍可 DNS-01 申请)
+    if [[ "${CF_MODE}" == "1" ]]; then
+        log_warn "检测到该域名解析到 Cloudflare, 但 xhttp 模式不支持 CDN 中转"
+        log_warn "(CF 代理的缓冲会破坏 xhttp 的流式传输)。如需 CDN 中转请改用 ws 模式 (菜单 1/2)。"
+        log_warn "本安装按直连处理 (证书仍走 DNS-01, 需 CF API Token 或自备证书);"
+        log_warn "请确保客户端能直连本机端口 (在 CF 面板对该记录用\"仅 DNS\"灰云)。"
     fi
 
     # xhttp 需要证书;若还没有,先探测 Nginx 环境、建伪装站并申请
