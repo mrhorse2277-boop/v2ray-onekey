@@ -75,6 +75,7 @@
 | 2026-10-23 | bash | 4.4 / 5.0 / 5.1 / 5.2 | `local -n`、`${v,,}` | 全部可用 |
 | 2026-10-23 | systemd | 237 / 247 / 252 | `AmbientCapabilities` | 全部可用 |
 | 2026-10-23 | 启动依赖检测 | 六系统 | 缺 curl/openssl/ss 时能否自动装齐 | 全部 PASS(见下) |
+| 2026-10-24 | Xray 内核 (上游 core) | 26.3.27 → 26.10.21 | 新版二进制对 REALITY/socks 生产配置与 xhttp 最小模板跑 `run -test`; `xray x25519` 新输出格式(`Password (PublicKey):`, 多一行 Hash32)下脚本 4 处公钥提取 awk; release notes 扫破坏性变更 | 配置全部 OK、4 处提取实测正确; notes 仅根证书安全更新, 无 C 档破坏。内核非运行时依赖, 此行仅备忘免后人重验 |
 
 **启动依赖检测六系统实测结果(2026-10-23)**:
 Debian 11 / 13、Ubuntu 18.04 / 20.04 / 22.04 / 24.04 均在最小化环境
@@ -162,14 +163,20 @@ systemd-run --machine=t11 --quiet --pipe --wait /bin/bash -c 'systemctl is-syste
   `settings.domainStrategy=UseIPv4`(60f59ca,用户 VPS IPv6 回程不稳),
   改配置模板时别丢;手工给存量机器补这个参数用 sed 定位
   `"protocol": "freedom"` 插入 settings 块
-- **菜单版本提示**: 菜单头部两行状态——`脚本版本`(当前/远端 + 🔴建议更新 /
-  🟢无需更新 / 🟢本地较新 / ⚪网络不通)与`节点配置`(🟢已是最新 / 🔴N 条待升级 /
-  未安装节点)。
-  最新版本号缓存在 `/usr/local/etc/v2ray/latest_version.cache`(6 小时 TTL,
+- **菜单版本提示**: 菜单头部状态——`脚本版本`(当前/远端 + 🔴建议更新 /
+  🟢无需更新 / 🟢本地较新 / ⚪网络不通)、`节点配置`(🟢已是最新 / 🔴N 条待升级 /
+  未安装节点), 以及已安装 core 的`Xray内核`/`V2Ray内核`行(🔴可更新 (菜单 9) /
+  🟢无需更新 / 🟢本地较新 / ⚪网络不通; 未装该 core 或版本读不出则整行不显示,
+  版本号不带 v 前缀, 与 `xray version` 输出一致)。
+  脚本最新版缓存在 `/usr/local/etc/v2ray/latest_version.cache`, 内核最新版缓存在
+  `core_ver_Xray-core.cache` / `core_ver_v2ray-core.cache`(均 6 小时 TTL,
   格式 `时间戳|版本号`, 失败写 `时间戳|`), 避免每次进菜单联网。
-  改菜单刷新逻辑时别去掉缓存, 否则 GitHub 被墙环境下每次刷新都会卡 8s。
+  内核最新版号从 `github.com/<repo>/releases/latest` 的 302 跳转地址提取
+  (`curl -sI` 读 location 头, 不走 API 无速率限制); 菜单 9 更新完内核会作废
+  这两个缓存。改菜单刷新逻辑时别去掉缓存, 否则 GitHub 被墙环境下每次刷新都会卡 8s。
   版本比较用 `version_gt`(逐段数值比较), **不能用字符串比较**——
-  `"1.5.10" < "1.5.2"` 在字符串比较下成立, 会误判。
+  `"1.5.10" < "1.5.2"` 在字符串比较下成立, 会误判;内核的日历版本
+  (`26.10.21` > `26.3.27`)同函数同样成立。
   版本相同只显示一个版本号(`v1.5.3  🟢 无需更新`), 不要渲染成 `v1.5.3 → v1.5.3`。
 - **待升级条数的判定**:`count_pending_migrations` 只读检测,**不看
   `migrations_done.txt`**。原因:全新安装从未写过 state 文件,只看 state 会把

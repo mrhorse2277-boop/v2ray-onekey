@@ -48,7 +48,7 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.5.3"
+SCRIPT_VERSION="1.5.4"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 # 最新版本号缓存: 菜单每次刷新都联网会很慢 (尤其 GitHub 被墙时), 缓存 6 小时
 # 格式: "<时间戳>|<版本号>" ; 取不到版本时写 "0|" 表示未知
@@ -2905,21 +2905,15 @@ do_uninstall() {
             rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d
             rm -f /usr/local/bin/xray
             rm -rf /usr/local/share/xray /usr/local/etc/xray
-            # 官方卸载后的残余: 模板配置与空目录清理
-            # (fhs-install-v2ray 会生成模板 config.json "{}", 不删则 rmdir 必然失败)
-            rm -f "${V2RAY_CONF_DIR}/config.json" "${XRAY_CONF_DIR}/config.json"
+            # 配置目录整体清除: 含官方安装器生成的模板 config.json 与脚本自身的
+            # 记录文件 (used_ports/gfw_list/迁移与版本缓存), 避免任何残留
             rm -rf "${V2RAY_CONF_DIR}" "${XRAY_CONF_DIR}"
-            rmdir "${V2RAY_CONF_DIR}" "${XRAY_CONF_DIR}" 2>/dev/null || true
             # 平滑重载 Nginx (宝塔或发行版), 绝不 stop 现有网站服务
             if [[ "${NGINX_ENV}" == "btpanel" && -x "${NGINX_BIN}" ]]; then
                 "${NGINX_BIN}" -t >/dev/null 2>&1 && "${NGINX_BIN}" -s reload
             elif command -v nginx >/dev/null 2>&1; then
                 nginx -t >/dev/null 2>&1 && systemctl reload nginx
             fi
-            # 清理脚本自身的缓存与记录文件
-            rm -f "${V2RAY_CONF_DIR}/used_ports.txt" "${V2RAY_CONF_DIR}/gfw_list.txt"
-            # 目录为空则删除, 非空 (还有用户文件) 保留
-            rmdir "${V2RAY_CONF_DIR}" "${XRAY_CONF_DIR}" 2>/dev/null || true
             log_info "全部卸载完成。证书 (acme.sh / ${CERT_DIR}) 与伪装站点目录保留,如需彻底清理请手动删除。"
             systemctl daemon-reload
             return
@@ -3513,6 +3507,8 @@ do_update_v2ray() {
     systemctl stop xray 2>/dev/null || true
     systemctl disable xray >/dev/null 2>&1 || true
     systemctl restart "${WS_SERVICE}" "${XHTTP_SERVICE}" "${SOCKS_SERVICE}" "${REALITY_SERVICE}" 2>/dev/null
+    # 内核版本缓存作废: 刚装的就是最新版, 下次进菜单重新取一次确认
+    rm -f "${V2RAY_CONF_DIR}"/core_ver_*.cache 2>/dev/null || true
     log_info "V2Ray / Xray 已更新,相关服务已重启。"
 }
 
@@ -3944,11 +3940,66 @@ get_disk_script_version() {
     fi
 }
 
-# 菜单头部的状态区: 两行, 一行脚本版本, 一行已装节点配置。
-# 竖排三项 (当前/最新/状态) 各占一行会让头部过高且右侧大片留白, 改为
-# "版本对 + 状态" 合并到一行, 节点配置另起一行, 两行宽度都在边框内 (≤52 列):
+# --- core 内核版本检测 (菜单头部提示, 只读) ---
+# 最新版号从 GitHub releases/latest 的 302 跳转地址提取 (不走 API, 无速率限制),
+# 与脚本版本缓存同策略: 缓存 6 小时, 取不到记失败标记, TTL 内不重试。
+CORE_VERSION_TTL=21600   # 6 小时
+
+get_core_installed_version() {
+    # $1 = core 二进制路径; 取 version 输出的第 2 个字段 (如 "Xray 26.10.21 ..." → 26.10.21)
+    "$1" version 2>/dev/null | head -1 | awk '{print $2}' | tr -d '\r'
+}
+
+get_core_latest_version() {
+    # $1 = 仓库 slug (XTLS/Xray-core / v2fly/v2ray-core); 输出最新版号, 取不到输出空
+    local repo="$1" cache now ts ver loc
+    cache="${V2RAY_CONF_DIR}/core_ver_$(basename "${repo}" 2>/dev/null).cache"
+    now="$(date +%s 2>/dev/null || echo 0)"
+
+    if [[ -f "${cache}" ]]; then
+        IFS='|' read -r ts ver < "${cache}" 2>/dev/null || true
+        if [[ "${ts}" =~ ^[0-9]+$ ]] && (( now - ts < CORE_VERSION_TTL )); then
+            [[ -n "${ver}" ]] && { echo "${ver}"; return 0; }
+            return 1     # 缓存里记的是"取不到", TTL 内不重试
+        fi
+    fi
+
+    ver=""
+    loc="$(curl -sI --max-time 8 "https://github.com/${repo}/releases/latest" 2>/dev/null \
+        | tr -d '\r' | grep -i '^location:' | grep -o 'tag/[^[:space:]]*' | head -1)"
+    ver="${loc#tag/}"
+    ver="${ver#v}"
+    mkdir -p "${V2RAY_CONF_DIR}" 2>/dev/null || true
+    echo "${now}|${ver}" > "${cache}" 2>/dev/null || true
+    [[ -n "${ver}" ]] && echo "${ver}" || return 1
+}
+
+show_core_version_line() {
+    # $1 = 显示名  $2 = core 二进制  $3 = 仓库 slug
+    # 未安装该 core 或版本读不出来时不输出这一行 (不瞎猜)
+    local label="$1" bin="$2" repo="$3" cur latest pad
+    [[ -x "${bin}" ]] || return 0
+    cur="$(get_core_installed_version "${bin}")"
+    [[ -n "${cur}" ]] || return 0
+    latest="$(get_core_latest_version "${repo}")"
+    pad=" "   # 对齐冒号: V2Ray内核 比 Xray内核 宽 1 列
+    [[ "${label}" == "V2Ray内核" ]] && pad=""
+    if [[ -z "${latest}" ]]; then
+        echo -e "${GREEN}  ${label}${pad}: ${cur}  ${YELLOW}⚪ 检测失败 (网络不通)${GREEN}${PLAIN}"
+    elif version_gt "${latest}" "${cur}"; then
+        echo -e "${GREEN}  ${label}${pad}: ${cur} → ${latest} ${RED}🔴 可更新 (菜单 9)${GREEN}${PLAIN}"
+    elif version_gt "${cur}" "${latest}"; then
+        echo -e "${GREEN}  ${label}${pad}: ${cur}  🟢 本地较新${PLAIN}"
+    else
+        echo -e "${GREEN}  ${label}${pad}: ${cur}  🟢 无需更新${PLAIN}"
+    fi
+}
+
+# 菜单头部的状态区: 脚本版本 / 节点配置各一行, 已安装的 core 内核再加行。
+# "版本对 + 状态" 合并到一行, 宽度都在边框内 (≤52 列):
 #   脚本版本 : v1.5.2 → v1.5.3  🔴 建议更新 (菜单 14)
 #   节点配置 : 🔴 2 条待升级 (菜单 15)
+#   Xray内核 : 26.3.27 → 26.10.21 🔴 可更新 (菜单 9)
 # 状态取值: 🟢 无需更新 / 🔴 建议更新 / 🟢 本地较新 / ⚪ 检测失败 (网络不通)
 show_version_line() {
     local latest local_ver status pending_line pending_n
@@ -3987,6 +4038,10 @@ show_version_line() {
         pending_line="${RED}🔴 ${pending_n} 条待升级 (菜单 15)${GREEN}"
     fi
     echo -e "${GREEN}  节点配置 : ${pending_line}${PLAIN}"
+
+    # 内核版本: 只对已安装的 core 各显示一行 (未装该 core 不显示)
+    show_core_version_line "Xray内核" "/usr/local/bin/xray" "XTLS/Xray-core"
+    show_core_version_line "V2Ray内核" "/usr/local/bin/v2ray" "v2fly/v2ray-core"
 
     # 磁盘已更新但当前进程仍是旧版: 单独一行提示
     if [[ "${local_ver}" != "${SCRIPT_VERSION}" ]]; then
