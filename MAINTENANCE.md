@@ -76,6 +76,7 @@
 | 2026-10-23 | systemd | 237 / 247 / 252 | `AmbientCapabilities` | 全部可用 |
 | 2026-10-23 | 启动依赖检测 | 六系统 | 缺 curl/openssl/ss 时能否自动装齐 | 全部 PASS(见下) |
 | 2026-10-24 | Xray 内核 (上游 core) | 26.3.27 → 26.10.21 | 新版二进制对 REALITY/socks 生产配置与 xhttp 最小模板跑 `run -test`; `xray x25519` 新输出格式(`Password (PublicKey):`, 多一行 Hash32)下脚本 4 处公钥提取 awk; release notes 扫破坏性变更 | 配置全部 OK、4 处提取实测正确; notes 仅根证书安全更新, 无 C 档破坏。内核非运行时依赖, 此行仅备忘免后人重验 |
+| 2026-10-24 | sing-box (客户端内核, 非本脚本依赖) | 1.13.x → 1.14.4 | 客户端兼容面核查: 1.14.0 release notes + 1.14.0..1.14.4 全部 174 条提交 + 官方弃用特性清单, 逐项对照脚本 5 类链接要素(vless-REALITY / vless-ws / vmess / socks / xhttp) | 无需改动。1.14.0 移除的 8 项弃用特性全是 sing-box 自身配置格式清理(rule-set/DNS/ACME/缓存字段), 不涉协议; 补丁线 174 提交均为 fix, 其中一条还是 REALITY 修复(VLESS Vision close); uTLS 升 1.8.7, `fp=chrome` 在。**预存限制: xhttp 传输 sing-box 从未支持**(v2ray-transport 文档只有 WS/HTTPUpgrade/gRPC/HTTP), 属生态现状非 1.14 回归, xhttp 节点仍以 v2rayN/v2rayNG(Xray 内核)为基准客户端 |
 
 **启动依赖检测六系统实测结果(2026-10-23)**:
 Debian 11 / 13、Ubuntu 18.04 / 20.04 / 22.04 / 24.04 均在最小化环境
