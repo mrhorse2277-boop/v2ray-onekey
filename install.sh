@@ -37,7 +37,8 @@
 #                                非交互卸载 (不带目标时交互选择)
 #   交互菜单 14 = 更新脚本自身 (从 GitHub 下载最新版覆盖本地脚本)
 #
-# ws 模式支持 Cloudflare CDN 中转: 域名解析到 CF IP 段自动启用, 证书走
+# ws 模式支持 Cloudflare CDN 中转: 安装时检测到域名解析落 CF IP 段会询问
+# (交互, 回车默认启用) / 自动启用 (非交互), CF_MODE=1 可强制; 证书走
 # DNS-01 (需 CF_Token/CF_Account_ID/CF_Zone_ID 或 CF_Email/CF_Key 环境变量,
 # 或自备证书放 /data/v2ray.crt|key 后安装)。
 #
@@ -54,7 +55,7 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.6.2"
+SCRIPT_VERSION="1.6.3"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 # 最新版本号缓存: 菜单每次刷新都联网会很慢 (尤其 GitHub 被墙时), 缓存 6 小时
 # 格式: "<时间戳>|<版本号>" ; 取不到版本时写 "0|" 表示未知
