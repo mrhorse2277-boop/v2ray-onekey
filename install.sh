@@ -48,7 +48,7 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.5.5"
+SCRIPT_VERSION="1.5.6"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 # 最新版本号缓存: 菜单每次刷新都联网会很慢 (尤其 GitHub 被墙时), 缓存 6 小时
 # 格式: "<时间戳>|<版本号>" ; 取不到版本时写 "0|" 表示未知
@@ -578,27 +578,34 @@ preflight_check() {
 }
 
 install_dependencies() {
-    log_info "安装基础依赖 (curl wget socat qrencode openssl cron)..."
+    # 安装路径的完整依赖集 (比 RUNTIME_DEPS 多 qrencode/socat/cron/证书链)。
+    # 安装动作统一走 install_packages_robust (锁等待/timeout/重试/半装修复),
+    # 不再裸跑 apt-get/dnf —— 安装路径与启动路径同一套健壮性覆盖。
+    local pkgmgr="" pkgs=""
     if command -v apt-get >/dev/null 2>&1; then
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y
-        apt-get install -y curl wget socat qrencode openssl cron ca-certificates iproute2 coreutils findutils
-        systemctl enable --now cron >/dev/null 2>&1 || systemctl enable --now crond >/dev/null 2>&1
+        pkgmgr="apt"
+        pkgs="curl wget socat qrencode openssl cron ca-certificates iproute2 coreutils findutils"
     elif command -v dnf >/dev/null 2>&1; then
-        # Rocky/Alma/Fedora: qrencode 在 EPEL (部分镜像已内置)
-        dnf install -y epel-release >/dev/null 2>&1 || true
-        dnf install -y curl wget socat qrencode openssl cronie iproute coreutils || true
-        command -v qrencode >/dev/null 2>&1 || dnf install -y qrencode >/dev/null 2>&1 || true
-        systemctl enable --now crond >/dev/null 2>&1
+        # Rocky/Alma/Fedora: qrencode 在 EPEL (健壮安装会先尝试 epel-release)
+        pkgmgr="dnf"
+        pkgs="curl wget socat qrencode openssl cronie iproute coreutils"
     elif command -v yum >/dev/null 2>&1; then
         # CentOS 7 (EOL): 若官方源已归档失败, 不阻断; qrencode 在 EPEL
-        yum install -y epel-release >/dev/null 2>&1 || true
-        yum install -y curl wget socat openssl cronie iproute coreutils || true
-        yum install -y qrencode >/dev/null 2>&1 || true
-        systemctl enable --now crond >/dev/null 2>&1
+        pkgmgr="yum"
+        pkgs="curl wget socat openssl cronie iproute coreutils qrencode"
     else
         log_error "未找到 apt-get / dnf / yum,无法自动安装依赖。"
         exit 1
+    fi
+    log_info "安装基础依赖 (${pkgs})..."
+    # shellcheck disable=SC2086
+    install_packages_robust "${pkgmgr}" ${pkgs}
+
+    # cron 自启 (acme.sh 续签依赖; 各发行版服务名不同)
+    if [[ "${pkgmgr}" == "apt" ]]; then
+        systemctl enable --now cron >/dev/null 2>&1 || systemctl enable --now crond >/dev/null 2>&1
+    else
+        systemctl enable --now crond >/dev/null 2>&1
     fi
 
     # 缺失项降级处理: 核心依赖必须存在, 次要依赖缺失仅告警
@@ -723,8 +730,8 @@ ensure_runtime_deps() {
     return 0
 }
 
-# 按包管理器安装运行时依赖 (只装缺失的, 不整包重装)
-# 按包管理器安装运行时依赖 (只装缺失的)。
+# 按包管理器健壮地安装一批软件包 (install_dependencies 与 install_runtime_deps
+# 共用, 消除原先"安装路径裸跑 apt / 启动路径带全套加固"的双轨差异)。
 # 设计原则: 尽力保障装成功, 不静默跳过。已覆盖的最差情况:
 #   1. apt 索引损坏/不同步 -> update 后仍失败, 用 --fix-missing 重试
 #   2. 某个包在源里不可用   -> 逐个安装, 不让一个包拖垮整批
@@ -733,18 +740,11 @@ ensure_runtime_deps() {
 #   5. 命令挂死(网络黑洞)     -> 所有 apt/dnf 调用套 timeout, 避免卡死菜单
 #   6. 磁盘不足               -> 安装前检查, 空间不够直接说明而不是装到一半失败
 #   7. 半装状态(dpkg interrupted) -> 尝试 dpkg --configure -a 修复后重试
+# 用法: install_packages_robust <apt|dnf|yum> <包名...>
 # 返回 0 表示"已尽力", 是否真的可用由调用方 command -v 复核。
-install_runtime_deps() {
-    local pkgmgr="$1" pkgs="" c
-    for c in ${RUNTIME_DEPS}; do
-        command -v "${c}" >/dev/null 2>&1 && continue
-        case "${c}" in
-            ss)     pkgs+="iproute2 " ;;
-            base64|od) pkgs+="coreutils " ;;
-            *)      pkgs+="${c} " ;;
-        esac
-    done
-    pkgs="$(printf '%s\n' ${pkgs} | sort -u | tr '\n' ' ')"
+install_packages_robust() {
+    local pkgmgr="$1"; shift
+    local pkgs="$*"
     [[ -z "${pkgs// /}" ]] && return 0
 
     local logf="/tmp/v2ray_deps_install.log"
@@ -843,6 +843,22 @@ install_runtime_deps() {
             ;;
     esac
     return 0
+}
+
+# 按包管理器安装运行时依赖 (只装缺失的): 命令名映射包名后走健壮安装。
+install_runtime_deps() {
+    local pkgmgr="$1" pkgs="" c
+    for c in ${RUNTIME_DEPS}; do
+        command -v "${c}" >/dev/null 2>&1 && continue
+        case "${c}" in
+            ss)     pkgs+="iproute2 " ;;
+            base64|od) pkgs+="coreutils " ;;
+            *)      pkgs+="${c} " ;;
+        esac
+    done
+    pkgs="$(printf '%s\n' ${pkgs} | sort -u | tr '\n' ' ')"
+    # shellcheck disable=SC2086
+    install_packages_robust "${pkgmgr}" ${pkgs}
 }
 
 # 探测系统现有 Nginx 环境 (宝塔面板 / 发行版 Nginx / 全新系统)
@@ -988,22 +1004,24 @@ nginx_check_reload() {
 
 open_firewall() {
     # 尽力而为:存在防火墙服务才放行,失败不阻断
-    # REALITY 端口在任何模式下都必须放行 (独立服务, 端口安装时才确定)
-    if [[ -n "${REALITY_PORT}" ]]; then :; fi
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw allow 80/tcp >/dev/null 2>&1
         ufw allow 443/tcp >/dev/null 2>&1
         [[ -n "${XHTTP_PORT}" ]]      && ufw allow "${XHTTP_PORT}/tcp"      >/dev/null 2>&1
-        [[ -n "${SOCKS_PORT}" ]]   && ufw allow "${SOCKS_PORT}/tcp"   >/dev/null 2>&1
-        [[ -n "${REALITY_PORT}" ]] && ufw allow "${REALITY_PORT}/tcp" >/dev/null 2>&1
+        [[ -n "${SOCKS_PORT}" ]]      && ufw allow "${SOCKS_PORT}/tcp"      >/dev/null 2>&1
+        [[ -n "${REALITY_PORT}" ]]    && ufw allow "${REALITY_PORT}/tcp"    >/dev/null 2>&1
+        # ws 独立端口场景 (443 被 REALITY 等占用时 WS_PORT != 443) 必须单独放行,
+        # 443 并入场景已被上面的通用 443 规则覆盖
+        [[ -n "${WS_PORT:-}" && "${WS_PORT}" != "443" ]] && ufw allow "${WS_PORT}/tcp" >/dev/null 2>&1
         log_info "已通过 ufw 放行相关端口。"
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
         firewall-cmd --permanent --add-service=http  >/dev/null 2>&1
         firewall-cmd --permanent --add-service=https >/dev/null 2>&1
         [[ -n "${XHTTP_PORT}" ]]      && firewall-cmd --permanent --add-port="${XHTTP_PORT}/tcp"      >/dev/null 2>&1
-        [[ -n "${SOCKS_PORT}" ]]   && firewall-cmd --permanent --add-port="${SOCKS_PORT}/tcp"   >/dev/null 2>&1
-        [[ -n "${REALITY_PORT}" ]] && firewall-cmd --permanent --add-port="${REALITY_PORT}/tcp" >/dev/null 2>&1
+        [[ -n "${SOCKS_PORT}" ]]      && firewall-cmd --permanent --add-port="${SOCKS_PORT}/tcp"      >/dev/null 2>&1
+        [[ -n "${REALITY_PORT}" ]]    && firewall-cmd --permanent --add-port="${REALITY_PORT}/tcp"    >/dev/null 2>&1
+        [[ -n "${WS_PORT:-}" && "${WS_PORT}" != "443" ]] && firewall-cmd --permanent --add-port="${WS_PORT}/tcp" >/dev/null 2>&1
         firewall-cmd --reload >/dev/null 2>&1
         log_info "已通过 firewalld 放行相关端口。"
     fi

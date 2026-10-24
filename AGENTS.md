@@ -209,7 +209,11 @@ systemd-run --machine=tXX --quiet --pipe --wait /bin/sh -c 'systemctl is-system-
   **注意**: 若在 nspawn 启动后才改 resolv.conf, resolved 可能再次覆盖, 导致
   `Temporary failure resolving` 让依赖安装假失败(2026-10 实测踩过)。做法:
   启动容器后立即 `systemctl disable --now systemd-resolved` 再写文件,
-  或写入后 `chattr +i` 锁定(测试完记得 `chattr -i` 再删目录)
+  或写入后 `chattr +i` 锁定(测试完记得 `chattr -i` 再删目录)。
+  2026-10-24 再踩一次并补充: 1804/2004/2204 首启时 resolved 会把**预引导就写好的
+  resolv.conf 换成 stub 符号链接**, 之后仅 disable+printf 不够(printf 写穿符号
+  链接写进了 stub); 必须 disable 后 `rm -f /etc/resolv.conf` 再写普通文件。
+  noble 与 Debian 系不启用 resolved, 不会中招
 
 **测试后必须清理**:`machinectl terminate` 所有机器、删掉 `/tmp/ns_*`、
 移除临时加的 debootstrap 脚本, 确认宿主机磁盘与服务恢复原状。
