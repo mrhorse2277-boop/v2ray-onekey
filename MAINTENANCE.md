@@ -105,7 +105,8 @@ unzip -o -q xray.zip xray && chmod +x xray
 ./xray run -test -c /usr/local/etc/xray/config_reality.json 2>&1 | tail -2
 ./xray run -test -c /usr/local/etc/v2ray/config_socks.json  2>&1 | tail -2
 
-# 3) 子命令输出格式核对 (脚本 4 处 awk 从这些行里取公钥/版本号)
+# 3) 子命令输出格式核对 (公钥推导收敛在 derive_reality_pubkey, 1 处 awk;
+#    密钥对生成 gen_x25519 1 处; 版本号取第 2 字段)
 KEY=$(./xray x25519 | sed -n 's/^PrivateKey: //p')
 ./xray x25519 -i "$KEY"        # 看行格式: Public key: 还是 Password (PublicKey):
 # 下面的提取结果必须等于上面输出的公钥, 版本号必须是第 2 个字段

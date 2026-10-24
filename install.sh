@@ -48,7 +48,7 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.5.4"
+SCRIPT_VERSION="1.5.5"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 # 最新版本号缓存: 菜单每次刷新都联网会很慢 (尤其 GitHub 被墙时), 缓存 6 小时
 # 格式: "<时间戳>|<版本号>" ; 取不到版本时写 "0|" 表示未知
@@ -160,6 +160,17 @@ gen_x25519() {
     X25519_PRIVKEY="$(echo "${out}" | awk -F': *' '/[Pp]rivate/{print $2; exit}')"
     X25519_PUBKEY="$(echo "${out}" | awk -F': *' '/[Pp]ublic|Password/{print $2; exit}')"
     [[ -n "${X25519_PRIVKEY}" && -n "${X25519_PUBKEY}" ]]
+}
+
+# 从 REALITY 私钥推导公钥 (xray x25519 -i)。全脚本唯一的 -i 推导解析点:
+# 公钥行格式随上游版本变过 ("Public key:" / "Password (PublicKey):"),
+# 上游格式再变只需改这里的 awk —— 菜单 7/11/10 共用本函数。
+# $1 = 私钥; 成功输出公钥, 失败输出空 (调用方自行回退 URL_FILE 历史值)。
+derive_reality_pubkey() {
+    local xray_bin
+    xray_bin="$(command -v xray 2>/dev/null || echo /usr/local/bin/xray)"
+    [[ -x "${xray_bin}" && -n "${1:-}" ]] || return 1
+    "${xray_bin}" x25519 -i "$1" 2>/dev/null | awk '/Public key|Password/{print $NF}'
 }
 
 # 校验 REALITY 伪装目标站: TLS 1.3 + H2 可用 (XTLS 官方推荐检查项)
@@ -379,31 +390,32 @@ pause() { read -rp "按回车键继续..." _; }
 # 停止服务并同步等待进程退出 (卸载用)。
 # 不同 systemd 版本 stop 完成时间差异大 (255 会异步收尾): 若发完信号就删 unit 文件,
 # stop 可能被跳过, 服务进程沦为孤儿继续监听端口。此函数等待进程真正退出, 兜底 SIGKILL。
-# 进程匹配限定本脚本配置路径 (run -config /usr/local/etc/{v2ray,xray}/config_*.json),
-# 不误伤系统里其他 v2ray/xray 实例。
-# 可移植性注意: 不用分组括号 (procps-ng 老版本 pgrep 对 (a|b) 分组行为不一致), 用两条简单正则。
+# 进程匹配必须精确到本服务自己的配置路径 (从 unit 的 ExecStart 提取):
+# ws/socks 同用 v2ray、reality/xhttp 同用 xray, 按 "config_" 前缀泛匹配会在
+# 卸载 A 模式时误杀 B 模式进程 (只能靠 Restart 兜底拉起, 造成一次断连)。
+# 可移植性注意: 不用分组括号 (procps-ng 老版本 pgrep 对 (a|b) 分组行为不一致)。
+svc_config_pattern() {
+    # 输出 "run -config <路径>" 精确匹配模式; 取不到输出空
+    local unit="/etc/systemd/system/${1}.service" exec_line cfg
+    [[ -f "${unit}" ]] && exec_line="$(grep -m1 '^ExecStart=' "${unit}" | cut -d'=' -f2-)"
+    # unit 不在磁盘时再问 systemctl (loaded 但文件刚被改名等场景)
+    [[ -z "${exec_line}" ]] && exec_line="$(systemctl show "${1}" -p ExecStart --value 2>/dev/null)"
+    cfg="$(echo "${exec_line}" | awk '{for(i=1;i<NF;i++) if($i=="-config"){print $(i+1); exit}}')"
+    [[ -n "${cfg}" ]] && echo "run -config ${cfg}"
+}
+
 stop_service_sync() {
-    local svc="$1" i alive p
-    local pats=(
-        'run -config /usr/local/etc/v2ray/config_'
-        'run -config /usr/local/etc/xray/config_'
-    )
+    local svc="$1" i pat
+    pat="$(svc_config_pattern "${svc}")"
     systemctl stop "${svc}" 2>/dev/null || true
+    # 拿不到本服务配置路径 (未安装/半卸载): 不做泛匹配强杀, 只依赖上面的 systemctl stop
+    [[ -z "${pat}" ]] && return 0
     for i in 1 2 3 4 5; do
-        alive=0
-        for p in "${pats[@]}"; do
-            if pgrep -f "${p}" >/dev/null 2>&1; then
-                alive=1
-                break
-            fi
-        done
-        [[ "${alive}" == "0" ]] && return 0
+        pgrep -f "${pat}" >/dev/null 2>&1 || return 0
         sleep 1
     done
-    # 循环走完说明仍有进程存活, 精确匹配后强杀
-    for p in "${pats[@]}"; do
-        pkill -KILL -f "${p}" 2>/dev/null || true
-    done
+    # 循环走完说明仍有进程存活, 精确匹配本服务后强杀
+    pkill -KILL -f "${pat}" 2>/dev/null || true
     return 0
 }
 
@@ -953,6 +965,8 @@ detect_nginx_env() {
 }
 
 # 校验/重载 Nginx (兼容宝塔与发行版)
+# 失败返回 1 而非 exit: 本函数会被证书签发/节点重置等流程以 "|| true" 调用,
+# exit 会绕过 || true 把整个脚本打断且不留回滚; 是否中止由调用方决定。
 nginx_check_reload() {
     # NGINX_BIN 未初始化时 (如重置节点先于 ws 安装被调用) 自动探测
     if [[ -z "${NGINX_BIN}" ]]; then
@@ -963,7 +977,7 @@ nginx_check_reload() {
     if ! "${NGINX_BIN}" -t >/dev/null 2>&1; then
         log_error "nginx 配置测试失败:"
         "${NGINX_BIN}" -t
-        exit 1
+        return 1
     fi
     if [[ "${NGINX_ENV}" == "btpanel" ]]; then
         "${NGINX_BIN}" -s reload 2>/dev/null || true
@@ -1577,7 +1591,8 @@ do_install_ws() {
         exit 1
     fi
     systemctl restart "${WS_SERVICE}"
-    nginx_check_reload
+    # nginx 配置坏了必须中止安装 (后面 is-active 可能被旧配置误判通过)
+    nginx_check_reload || exit 1
     sleep 1
 
     if ! systemctl is-active --quiet "${WS_SERVICE}"; then
@@ -2020,6 +2035,41 @@ detect_vps_region() {
     esac
 }
 
+# 探测候选目标站池 (安装与菜单 10 换站共用): 逐个 TLS 校验 + 实测 TCP 延迟,
+# 通过的记 "dest|延迟ms", 最多收 10 个, 结果按延迟升序存入全局数组 PROBE_OK_DESTS。
+# 参数 $1 = 候选数组名 (nameref, 元素格式 "dest|地区", 地区仅用于日志)。
+probe_reality_dest_pool() {
+    local -n _pool="$1"
+    PROBE_OK_DESTS=()
+    local entry d s dup pd ms
+    local probed=()
+    for entry in "${_pool[@]}"; do
+        d="${entry%%|*}"; s="${d%%:*}"
+        dup=0
+        for pd in "${probed[@]}"; do [[ "${pd}" == "${d}" ]] && dup=1; done
+        [[ "${dup}" == "1" ]] && continue
+        probed+=("${d}")
+        log_info "校验伪装目标站 ${d} (${entry##*|}) ..."
+        if check_reality_dest "${d}" "${s}"; then
+            # 实测 TCP 握手延迟 (毫秒, 取整)
+            ms=$( { TIMEFORMAT=%R; time timeout 5 bash -c "echo > /dev/tcp/${d%%:*}/${s}" 2>/dev/null; } 2>&1 )
+            [[ -z "${ms}" ]] && ms=9999
+            ms=$(awk -v t="${ms}" 'BEGIN{printf "%d", t*1000}')
+            PROBE_OK_DESTS+=("${d}|${ms}")
+            log_info "  -> 可用 (TCP 延迟 ${ms}ms)"
+        else
+            log_info "  -> 不可用,跳过"
+        fi
+        # 最多探测通过 10 个即可
+        (( ${#PROBE_OK_DESTS[@]} >= 10 )) && break
+    done
+    if (( ${#PROBE_OK_DESTS[@]} > 0 )); then
+        # 按实测延迟升序排序 (稳定: 同延迟保持原序)
+        # shellcheck disable=SC2206
+        PROBE_OK_DESTS=($(printf '%s\n' "${PROBE_OK_DESTS[@]}" | sort -t'|' -k2 -n))
+    fi
+}
+
 # REALITY 目标站交互选择:
 #   1..N  从探测通过的候选站中挑选 (按实测延迟升序, 列表带延迟)
 #   c     自定义输入任意域名:port (校验 TLS1.3/H2 达标才接受, 不达标可重输)
@@ -2145,37 +2195,10 @@ do_install_reality() {
         sorted_pool=("${pool_head[@]}" "${pool_tail[@]}")
     fi
 
-    # TLS 探测 + 实测 TCP 延迟: 通过的记入 "dest|延迟ms", 之后按延迟升序排
-    local ok_dests=()
-    local probed=()
-    for entry in "${sorted_pool[@]}"; do
-        local d="${entry%%|*}"
-        local region="${entry##*|}"
-        local s="${d%%:*}"
-        local dup=0
-        local pd
-        for pd in "${probed[@]}"; do [[ "${pd}" == "${d}" ]] && dup=1; done
-        [[ "${dup}" == "1" ]] && continue
-        probed+=("${d}")
-        log_info "校验伪装目标站 ${d} (${region}) ..."
-        if check_reality_dest "${d}" "${s}"; then
-            # 实测 TCP 握手延迟 (毫秒, 取整)
-            local ms
-            ms=$( { TIMEFORMAT=%R; time timeout 5 bash -c "echo > /dev/tcp/${d%%:*}/${s}" 2>/dev/null; } 2>&1 )
-            [[ -z "${ms}" ]] && ms=9999
-            ms=$(awk -v t="${ms}" 'BEGIN{printf "%d", t*1000}')
-            ok_dests+=("${d}|${ms}")
-            log_info "  -> 可用 (TCP 延迟 ${ms}ms)"
-        else
-            log_info "  -> 不可用,跳过"
-        fi
-        # 最多探测通过 10 个即可
-        (( ${#ok_dests[@]} >= 10 )) && break
-    done
-
+    # TLS 探测 + 实测 TCP 延迟 (与菜单 10 换站共用 probe_reality_dest_pool)
+    probe_reality_dest_pool sorted_pool
+    local ok_dests=("${PROBE_OK_DESTS[@]}")
     if (( ${#ok_dests[@]} > 0 )); then
-        # 按实测延迟升序排序 (稳定: 同延迟保持原序)
-        ok_dests=($(printf '%s\n' "${ok_dests[@]}" | sort -t'|' -k2 -n))
         log_info "候选按实测延迟排序: ${ok_dests[0]%%|*} (${ok_dests[0]##*|}ms) 最快"
     fi
     fi   # end REALITY_DEST env override
@@ -2423,6 +2446,8 @@ rebuild_url_file() {
             echo "${u}"
         done
     } > "${URL_FILE}"
+    # 与 INFO_FILE 同级敏感 (含 uuid/socks 凭据), 统一 600
+    chmod 600 "${URL_FILE}" 2>/dev/null || true
 }
 
 # 从磁盘上的实际配置现场生成全部当前有效链接并重建导出文件 (do_show_info 的生成逻辑,
@@ -2664,7 +2689,7 @@ collect_current_urls() {
         r_sni="$(grep -A1 '"serverNames"' "${REALITY_CONF}" | grep -o '"[^"]*"' | tr -d '"' | sed -n 2p)"
         r_sid="$(grep -A1 '"shortIds"' "${REALITY_CONF}" | grep -o '"[0-9a-f]*"' | tr -d '"' | head -1)"
         r_priv="$(grep -o '"privateKey": "[^"]*"' "${REALITY_CONF}" | cut -d'"' -f4)"
-        r_pbk="$(xray x25519 -i "${r_priv}" 2>/dev/null | awk '/Public key|Password/{print $NF}')"
+        r_pbk="$(derive_reality_pubkey "${r_priv}")"
         # 私钥推导失败才回退沿用历史链接的 pbk (此时提示可能不可用)
         if [[ -z "${r_pbk}" ]]; then
             r_pbk="$(grep reality "${URL_FILE}" 2>/dev/null | tail -1 | grep -o 'pbk=[^&]*' | cut -d= -f2)"
@@ -2839,7 +2864,7 @@ do_uninstall() {
 
     case "${choice}" in
         1)
-            stop_service_sync "${WS_SERVICE}" v2ray
+            stop_service_sync "${WS_SERVICE}"
             systemctl disable "${WS_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${WS_SERVICE}.service" "${WS_CONF}"
             # 兼容宝塔与发行版: 两个可能位置都尝试清理 (文件不存在则无操作)
@@ -2853,35 +2878,35 @@ do_uninstall() {
             ;;
         2)
             # 新旧两套都要清: xhttp 模式 (xray-xhttp) 与未迁移的旧 h2 (v2ray-h2)
-            stop_service_sync "${XHTTP_SERVICE}" xray
+            stop_service_sync "${XHTTP_SERVICE}"
             systemctl disable "${XHTTP_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${XHTTP_SERVICE}.service" "${XHTTP_CONF}"
             if [[ -f "/etc/systemd/system/${LEGACY_H2_SERVICE}.service" || -f "${LEGACY_H2_CONF}" ]]; then
-                stop_service_sync "${LEGACY_H2_SERVICE}" v2ray
+                stop_service_sync "${LEGACY_H2_SERVICE}"
                 systemctl disable "${LEGACY_H2_SERVICE}" >/dev/null 2>&1
                 rm -f "/etc/systemd/system/${LEGACY_H2_SERVICE}.service" "${LEGACY_H2_CONF}"
             fi
             sed -i '/### vmess+h2/,/^$/d;/### vless+h2/,/^$/d;/### vmess+xhttp/,/^$/d;/### vless+xhttp/,/^$/d' "${INFO_FILE}" 2>/dev/null
             ;;
         3)
-            stop_service_sync "${SOCKS_SERVICE}" v2ray
+            stop_service_sync "${SOCKS_SERVICE}"
             systemctl disable "${SOCKS_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${SOCKS_SERVICE}.service" "${SOCKS_CONF}"
             sed -i '/### socks$/,/^$/d' "${INFO_FILE}" 2>/dev/null
             ;;
         4)
-            stop_service_sync "${REALITY_SERVICE}" xray
+            stop_service_sync "${REALITY_SERVICE}"
             systemctl disable "${REALITY_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${REALITY_SERVICE}.service" "${REALITY_CONF}"
             sed -i '/### vless+reality$/,/^$/d' "${INFO_FILE}" 2>/dev/null
             ;;
         5)
-            stop_service_sync "${WS_SERVICE}" v2ray
-            stop_service_sync "${XHTTP_SERVICE}" xray
-            stop_service_sync "${SOCKS_SERVICE}" v2ray
-            stop_service_sync "${REALITY_SERVICE}" xray
+            stop_service_sync "${WS_SERVICE}"
+            stop_service_sync "${XHTTP_SERVICE}"
+            stop_service_sync "${SOCKS_SERVICE}"
+            stop_service_sync "${REALITY_SERVICE}"
             # 未迁移的旧 h2 服务一并停用清理
-            stop_service_sync "${LEGACY_H2_SERVICE}" v2ray
+            stop_service_sync "${LEGACY_H2_SERVICE}"
             systemctl disable "${WS_SERVICE}" "${XHTTP_SERVICE}" "${SOCKS_SERVICE}" "${REALITY_SERVICE}" "${LEGACY_H2_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${WS_SERVICE}.service" "/etc/systemd/system/${XHTTP_SERVICE}.service" \
                   "/etc/systemd/system/${SOCKS_SERVICE}.service" "/etc/systemd/system/${REALITY_SERVICE}.service" \
@@ -2937,7 +2962,7 @@ build_reality_link_from_conf() {
     # 推导失败才回退沿用 URL_FILE 里的旧值 (此时提示可能不可用)
     local privkey
     privkey="$(grep -o '"privateKey": "[^"]*"' "${REALITY_CONF}" | cut -d'"' -f4)"
-    pubkey="$(xray x25519 -i "${privkey}" 2>/dev/null | awk '/Public key|Password/{print $NF}')"
+    pubkey="$(derive_reality_pubkey "${privkey}")"
     if [[ -z "${pubkey}" ]]; then
         pubkey="$(grep reality "${URL_FILE}" 2>/dev/null | tail -1 | grep -o 'pbk=[^&]*' | cut -d= -f2)"
         log_warn "公钥推导失败,链接沿用旧 pbk (若刚更换过密钥则此链接不可用)。"
@@ -3385,29 +3410,9 @@ do_change_reality_dest() {
     done
     sorted_pool=("${pool_head[@]}" "${pool_tail[@]}")
 
-    local ok_dests=() probed=()
-    for entry in "${sorted_pool[@]}"; do
-        local d="${entry%%|*}" s="${d%%:*}"
-        local dup=0 pd
-        for pd in "${probed[@]}"; do [[ "${pd}" == "${d}" ]] && dup=1; done
-        [[ "${dup}" == "1" ]] && continue
-        probed+=("${d}")
-        log_info "校验伪装目标站 ${d} ..."
-        if check_reality_dest "${d}" "${s}"; then
-            local ms
-            ms=$( { TIMEFORMAT=%R; time timeout 5 bash -c "echo > /dev/tcp/${d%%:*}/${s}" 2>/dev/null; } 2>&1 )
-            [[ -z "${ms}" ]] && ms=9999
-            ms=$(awk -v t="${ms}" 'BEGIN{printf "%d", t*1000}')
-            ok_dests+=("${d}|${ms}")
-            log_info "  -> 可用 (TCP 延迟 ${ms}ms)"
-        else
-            log_info "  -> 不可用,跳过"
-        fi
-        (( ${#ok_dests[@]} >= 10 )) && break
-    done
-    if (( ${#ok_dests[@]} > 0 )); then
-        ok_dests=($(printf '%s\n' "${ok_dests[@]}" | sort -t'|' -k2 -n))
-    fi
+    # 探测 + 排序与安装共用同一 helper (见 probe_reality_dest_pool)
+    probe_reality_dest_pool sorted_pool
+    local ok_dests=("${PROBE_OK_DESTS[@]}")
 
     if [[ -t 0 ]]; then
         select_reality_dest_interactive ok_dests
@@ -3467,7 +3472,7 @@ do_change_reality_dest() {
     # pbk 必须与配置内私钥配对, 私钥推导优先; URL_FILE 历史值只作推导失败的兜底
     local privkey
     privkey="$(grep -o '"privateKey": "[^"]*"' "${REALITY_CONF}" | cut -d'"' -f4)"
-    cur_pubkey="$(xray x25519 -i "${privkey}" 2>/dev/null | awk '/Public key|Password/{print $NF}')"
+    cur_pubkey="$(derive_reality_pubkey "${privkey}")"
     if [[ -z "${cur_pubkey}" ]]; then
         cur_pubkey="$(grep reality "${URL_FILE}" 2>/dev/null | tail -1 | grep -o 'pbk=[^&]*' | cut -d= -f2)"
         log_warn "公钥推导失败,链接沿用历史 pbk (可能与当前密钥不配对, 请重置密钥)。"
@@ -3754,7 +3759,7 @@ migr_h2_to_xhttp() {
 
     # 4) 服务单元: 停旧起新。旧 unit 删掉, 新 unit 由 write_xhttp_service 生成
     if [[ -f "/etc/systemd/system/${LEGACY_H2_SERVICE}.service" ]]; then
-        stop_service_sync "${LEGACY_H2_SERVICE}" v2ray
+        stop_service_sync "${LEGACY_H2_SERVICE}"
         systemctl disable "${LEGACY_H2_SERVICE}" >/dev/null 2>&1 || true
         rm -f "/etc/systemd/system/${LEGACY_H2_SERVICE}.service"
     fi

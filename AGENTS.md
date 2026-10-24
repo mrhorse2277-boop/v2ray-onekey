@@ -133,9 +133,10 @@ raw 拉取源,**没有版本分支/tag 隔离**:
 2. **配置模板校验**: 新版二进制对四个模式的配置跑 `run -test` / `v2ray test`:
    本机已装的模式用真实生产配置, 没装的模式用最小模板补(xhttp 自签证书即可)
 3. **子命令输出核对**: 脚本有解析的子命令逐一在新版下实跑对照——
-   `xray x25519 -i`(公钥推导, 4 处 awk 提取)、`xray|v2ray version`(版本号取
+   `xray x25519 -i`(公钥推导, 收敛在 `derive_reality_pubkey` 单函数, 1 处 awk;
+   密钥对生成另有 `gen_x25519` 1 处)、`xray|v2ray version`(版本号取
    第 2 字段)。**输出格式变了而解析没跟上 = 静默坏链接**: 26.10.21 把
-   `Public key:` 改成 `Password (PublicKey):` 还多了 Hash32 行, 现有 awk
+   `Public key:` 改成 `Password (PublicKey):` 还多了 Hash32 行, 解析 awk
    恰好是双格式匹配才没出事——这是核查要兜住的典型风险
 4. **真实链路**: 在已装新版内核的机器上跑一次菜单 7, 确认 REALITY 链接
    (尤其 pbk)生成正确
