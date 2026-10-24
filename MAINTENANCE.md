@@ -86,6 +86,51 @@ AGENTS.md 第 4 节的踩坑清单。
 **新增依赖能力时**:先更新 AGENTS.md 的能力基线表, 再按 A 档跑六系统,
 最后在此追加记录(写"已按 A 档全矩阵验证"即可)。
 
+### 内核 (Xray/v2ray) 上游兼容性核查流程
+
+触发条件与判定档位见 AGENTS.md 第 3 节"内核上游更新的兼容性核查"。以下命令
+照抄即可(2026-10-24 Xray 26.3.27→26.10.21 那轮的原始流程),全程 /tmp 沙箱,
+不覆盖已装内核、不碰生产服务:
+
+```bash
+mkdir -p /tmp/xt_test && cd /tmp/xt_test
+# 1) 新版二进制下沙箱 (v2fly 同法: v2fly/v2ray-core releases 下 v2ray-linux-64.zip)
+curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/<新tag>/Xray-linux-64.zip"
+unzip -o -q xray.zip xray && chmod +x xray
+./xray version | head -1
+
+# 2) 配置校验: 本机已装的模式用真配置, 没装的用下方最小模板补;
+#    ws/socks 生产跑 v2fly 内核, 换用新版 v2ray 二进制跑 v2ray test -c <conf>
+./xray run -test -c /usr/local/etc/xray/config_reality.json 2>&1 | tail -2
+./xray run -test -c /usr/local/etc/v2ray/config_socks.json  2>&1 | tail -2
+
+# 3) 子命令输出格式核对 (脚本 4 处 awk 从这些行里取公钥/版本号)
+KEY=$(./xray x25519 | sed -n 's/^PrivateKey: //p')
+./xray x25519 -i "$KEY"        # 看行格式: Public key: 还是 Password (PublicKey):
+# 下面的提取结果必须等于上面输出的公钥, 版本号必须是第 2 个字段
+./xray x25519 -i "$KEY" | awk '/Public key|Password/{print $NF}'
+./xray version | awk '{print $2}'
+
+# 4) 若生产内核已是新版: 跑一次菜单 7, 核对 REALITY 链接(尤其 pbk)生成正确
+cd / && rm -rf /tmp/xt_test    # 用完清理
+```
+
+xhttp 最小校验模板(本机没装 xhttp 时用; 先在同目录自签证书:
+`openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -keyout key.pem
+-out cert.pem -days 2 -nodes -subj "/CN=x.test"`):
+
+```json
+{ "log": {"loglevel": "warning"},
+  "inbounds": [{"listen": "127.0.0.1", "port": 18443, "protocol": "vless",
+    "settings": {"clients": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}], "decryption": "none"},
+    "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/testpath", "mode": "auto"},
+      "security": "tls", "tlsSettings": {"certificates": [{"certificateFile": "cert.pem", "keyFile": "key.pem"}], "alpn": ["h2"]}}}],
+  "outbounds": [{"protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}}] }
+```
+
+判定: 配置全 OK 且子命令输出与脚本解析一致 → 能力未变, 在上方 B 档表记一行;
+上游移除/改变脚本用到的能力 → 按 C 档改脚本 + 六系统全矩阵。
+
 ## 多发行版测试方法 (systemd-nspawn)
 
 单台 Debian VPS 即可覆盖多个发行版,**不需要重装**:
