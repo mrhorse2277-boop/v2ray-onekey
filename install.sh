@@ -32,8 +32,14 @@
 #   bash install.sh socks        非交互安装 socks5
 #   bash install.sh reality      非交互安装 vless+REALITY
 #   bash install.sh info         查看全部已安装节点
-#   bash install.sh uninstall    交互卸载
+#   bash install.sh checkreality REALITY 伪装站健康巡检 (只读)
+#   bash install.sh uninstall [ws|xhttp|socks|reality|all]
+#                                非交互卸载 (不带目标时交互选择)
 #   交互菜单 14 = 更新脚本自身 (从 GitHub 下载最新版覆盖本地脚本)
+#
+# ws 模式支持 Cloudflare CDN 中转: 域名解析到 CF IP 段自动启用, 证书走
+# DNS-01 (需 CF_Token/CF_Account_ID/CF_Zone_ID 或 CF_Email/CF_Key 环境变量,
+# 或自备证书放 /data/v2ray.crt|key 后安装)。
 #
 
 export LC_ALL=C
@@ -48,7 +54,7 @@ V2RAY_CONF_DIR="/usr/local/etc/v2ray"
 V2RAY_INSTALL_SCRIPT="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
 
 # --- 脚本自更新 (菜单 14) ---
-SCRIPT_VERSION="1.5.6"
+SCRIPT_VERSION="1.6.0"
 SELF_UPDATE_URL="https://raw.githubusercontent.com/mrhorse2277-boop/v2ray-onekey/main/install.sh"
 # 最新版本号缓存: 菜单每次刷新都联网会很慢 (尤其 GitHub 被墙时), 缓存 6 小时
 # 格式: "<时间戳>|<版本号>" ; 取不到版本时写 "0|" 表示未知
@@ -101,6 +107,8 @@ URL_FILE="/root/v2ray_share_url.txt"
 
 # DOMAIN 支持环境变量预设 (非交互安装), 交互模式下仍会提示输入
 DOMAIN="${DOMAIN:-}"
+# CDN 中转模式 (域名解析落在 CF IP 段时 check_domain 置 1): 证书走 DNS-01
+CF_MODE=0
 MODE=""                 # ws | xhttp | socks | reality
 PROTOCOL=""             # vmess | vless (socks/reality 模式下为空/固定)
 UUID=""
@@ -288,11 +296,18 @@ validate_core_config() {
 
 # 撤销端口记录 (安装/重置取消或失败时用, 避免未真正使用的端口长期占用
 # gen_port 的可用池)。只删一条与 $1 相同的记录。
+# 注意 grep -vx 在"删掉后一条不剩"时退出码为 1 (无选中行), 不是错误,
+# 不能用 && 链接 mv —— 否则端口号是文件唯一记录时永远删不掉 (1.6.0 修)。
 unrecord_port() {
     local used_file="${V2RAY_CONF_DIR}/used_ports.txt"
     [[ -f "${used_file}" ]] || return 0
     local tmp="${used_file}.tmp.$$"
-    grep -vx "$1" "${used_file}" > "${tmp}" 2>/dev/null && mv -f "${tmp}" "${used_file}" || rm -f "${tmp}"
+    grep -vx "$1" "${used_file}" > "${tmp}" 2>/dev/null
+    if [[ $? -le 1 ]]; then
+        mv -f "${tmp}" "${used_file}"
+    else
+        rm -f "${tmp}"
+    fi
 }
 
 # 端口占用检查 (不含历史记录, 只看当前实际监听)
@@ -1044,6 +1059,35 @@ get_public_ip() {
     PUBLIC_IP="${ip//[$'\r\n']/}"
 }
 
+# --- Cloudflare CDN 判定 (ws 模式 CDN 中转) ---
+# 域名解析落在 CF 公布的 IPv4 段内即视为 CDN 中转(橙云)。表固化于脚本
+# (CF 官方 ips-v4 快照); 过期最多导致"检测不到 CDN 走直连路径", 不会出错行为。
+CF_IPV4_RANGES=(
+    "173.245.48.0/20" "103.21.244.0/22" "103.22.200.0/22" "103.31.4.0/22"
+    "141.101.64.0/18" "108.162.192.0/18" "190.93.240.0/20" "188.114.96.0/20"
+    "197.234.240.0/22" "198.41.128.0/17" "162.158.0.0/15" "104.16.0.0/13"
+    "104.24.0.0/14" "172.64.0.0/13" "131.0.72.0/22"
+)
+# 判定 IP 是否落在任一 CF 段内。awk 只用整数除法比较 (mawk 无位运算函数,
+# Debian/Ubuntu 默认 mawk, 见 MAINTENANCE 已知敏感点)
+ip_in_cf_range() {
+    local ip="$1" net base bits
+    [[ "${ip}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    for net in "${CF_IPV4_RANGES[@]}"; do
+        base="${net%%/*}"; bits="${net##*/}"
+        if awk -v ip="${ip}" -v base="${base}" -v bits="${bits}" 'BEGIN{
+            split(ip,a,"."); split(base,b,".")
+            block = (bits >= 32) ? 1 : (2 ^ (32 - bits))
+            ai = int((a[1]*16777216 + a[2]*65536 + a[3]*256 + a[4]) / block)
+            bi = int((b[1]*16777216 + b[2]*65536 + b[3]*256 + b[4]) / block)
+            exit (ai == bi) ? 0 : 1
+        }'; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 check_domain() {
     local domain="$1"
     if ! echo "${domain}" | grep -Eq '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$'; then
@@ -1071,6 +1115,14 @@ except Exception: pass" "${domain}" 2>/dev/null)"
     fi
 
     get_public_ip
+    # CDN 中转: 域名解析到 CF 边缘 IP 属预期, 不要求指向本机;
+    # 证书改走 DNS-01 (80 端口 HTTP-01 对橙云域名不可靠)
+    if ip_in_cf_range "${resolved}"; then
+        CF_MODE=1
+        log_info "域名 ${domain} 解析到 ${resolved} (Cloudflare IP 段): 判定为 CDN 中转模式。"
+        log_confirm "该模式流量经 CF 边缘回源本机 443; 证书签发走 DNS-01, 需要 CF API 凭据。"
+        return 0
+    fi
     if [[ -z "${PUBLIC_IP}" ]]; then
         log_warn "无法获取本机公网 IP,跳过域名解析核对。"
         return 0
@@ -1251,6 +1303,57 @@ install_acme() {
     fi
 }
 
+# CDN 中转模式 (橙云域名) 的证书签发: DNS-01 via acme.sh dns_cf。
+# 凭据优先级: 环境变量 CF_Token(+CF_Account_ID/CF_Zone_ID, API Token)
+# 或 CF_Email+CF_Key (Global Key); 都没有时交互询问, 非交互直接报错。
+issue_certificate_dns01() {
+    if [[ -z "${CF_Token:-}" && -z "${CF_Key:-}" ]]; then
+        if [[ -t 0 ]]; then
+            log_confirm "CDN 中转模式需要 Cloudflare API 凭据完成 DNS-01 签发:"
+            read -rp "CF API Token: " CF_Token
+            read -rp "CF Account ID (可空): " CF_Account_ID
+            read -rp "CF Zone ID (可空): " CF_Zone_ID
+        else
+            log_error "CDN 模式签发证书需要 CF 凭据 (环境变量 CF_Token(+CF_Account_ID/CF_Zone_ID) 或 CF_Email+CF_Key)。"
+            log_error "或先自备证书放到 ${CRT_FILE} 与 ${KEY_FILE} 后重跑本脚本。"
+            return 1
+        fi
+    fi
+    [[ -n "${CF_Token:-}" ]]      && export CF_Token
+    [[ -n "${CF_Account_ID:-}" ]] && export CF_Account_ID
+    [[ -n "${CF_Zone_ID:-}" ]]    && export CF_Zone_ID
+    [[ -n "${CF_Email:-}" ]]      && export CF_Email
+    [[ -n "${CF_Key:-}" ]]        && export CF_Key
+
+    local cert_backup=""
+    if [[ -f "${CRT_FILE}" ]]; then
+        cert_backup="${CRT_FILE}.bak.$$"
+        cp -a "${CRT_FILE}" "${cert_backup}"
+    fi
+
+    log_info "使用 DNS-01 (dns_cf) 申请 Let's Encrypt 证书 (域名: ${DOMAIN})..."
+    if /root/.acme.sh/acme.sh --issue -d "${DOMAIN}" --dns dns_cf --server letsencrypt --log; then
+        /root/.acme.sh/acme.sh --install-cert -d "${DOMAIN}" \
+            --fullchain-file "${CRT_FILE}" \
+            --key-file "${KEY_FILE}" \
+            --reloadcmd "bash -c '${NGINX_BIN} -s reload 2>/dev/null; systemctl reload nginx 2>/dev/null; systemctl restart ${WS_SERVICE} ${XHTTP_SERVICE} 2>/dev/null; exit 0'"
+        chmod 640 "${KEY_FILE}" 2>/dev/null
+        chgrp nogroup "${KEY_FILE}" 2>/dev/null || chgrp nobody "${KEY_FILE}" 2>/dev/null || true
+        log_info "证书申请并安装成功 (DNS-01): ${CRT_FILE}"
+        [[ -n "${cert_backup}" ]] && rm -f "${cert_backup}"
+        return 0
+    fi
+    log_warn "DNS-01 证书申请失败 (常见原因: CF Token 权限不足/Zone 错误, 或 DNS 传播超时)。"
+    if [[ -n "${cert_backup}" ]]; then
+        mv -f "${cert_backup}" "${CRT_FILE}"
+        log_info "已保留原有证书文件 ${CRT_FILE}。"
+    else
+        rm -f "${CRT_FILE}" "${KEY_FILE}"
+    fi
+    log_confirm "可检查 /root/.acme.sh/acme.sh.log, 或自备证书放到 ${CRT_FILE} 与 ${KEY_FILE} 后重跑。"
+    return 1
+}
+
 issue_certificate() {
     mkdir -p "${CERT_DIR}"
     if [[ -f "${CRT_FILE}" && -f "${KEY_FILE}" ]]; then
@@ -1259,6 +1362,12 @@ issue_certificate() {
     fi
 
     install_acme
+
+    # CDN 中转模式: 80 端口 HTTP-01 对橙云域名不可达, 改走 DNS-01
+    if [[ "${CF_MODE:-0}" == "1" ]]; then
+        issue_certificate_dns01
+        return
+    fi
 
     # 首次签发时序: 现有 Nginx 可能还没有为该域名服务 80 端口,
     # 先写一个仅含 webroot 验证目录的临时 80 端口站点并重载, 验证通过后再签发
@@ -1572,7 +1681,9 @@ do_install_ws() {
 
     create_webroot
     ensure_v2ray
-    issue_certificate
+    # CDN 中转模式下 DNS-01 失败 (无 CF 凭据) 时干净中止,
+    # 不继续写到一半的配置 (直连模式申请失败走函数内的降级提示, 仍返回 0)
+    issue_certificate || { log_error "证书不可用, 本次安装中止。"; exit 1; }
 
     UUID="$(gen_uuid)"
     INTERNAL_PORT="$(gen_port "${V2RAY_CONF_DIR}/used_ports.txt")"
@@ -1637,11 +1748,20 @@ do_install_ws() {
     if [[ "${NGINX_ENV}" == "btpanel" ]]; then
         log_confirm "宝塔环境: 站点配置已写入 ${WS_NGINX_CONF},可在宝塔面板正常管理原有网站。"
     fi
+    if [[ "${CF_MODE:-0}" == "1" ]]; then
+        log_confirm "CDN 中转模式已启用, 请在 Cloudflare 面板确认:"
+        log_confirm "  - SSL/TLS 加密模式设为 Full (strict) (回源 443 用本机证书)"
+        log_confirm "  - WebSockets 现代账户默认开启, 无需手动设置"
+        log_confirm "  - 若回源不通, 先检查本机 443 是否对 CF IP 段放行"
+    fi
     log_confirm "ws+tls 安装完成。"
 }
 
 # ---------- xhttp + tls 模式 (Xray 直接监听 TLS, 独立端口, 不依赖 Nginx) ----------
 # 传输用 xhttp (Xray 官方对 h2 的继任者)。alpn 锁 h2: xhttp 跑在 HTTP/2 之上。
+# 三个直连模式 (xhttp/socks/reality) 的 inbound 均不写 listen: 内核按通配地址监听,
+# 有 IPv6 时双栈 ([::] 且接受 v4-mapped), 无 IPv6 自动回退 0.0.0.0。
+# 硬编码 "0.0.0.0" 会让仅 IPv6 客户端不可达, 硬编码 "::" 会在无 IPv6 内核上绑不上。
 
 write_xhttp_v2ray_config() {
     local tls_settings='"tlsSettings": {
@@ -1688,7 +1808,6 @@ write_xhttp_v2ray_config() {
   "inbounds": [
     {
       "port": ${XHTTP_PORT},
-      "listen": "0.0.0.0",
       ${protocol_block},
       "streamSettings": {
         "network": "xhttp",
@@ -1781,7 +1900,9 @@ do_install_xhttp() {
     # xhttp 传输只有 Xray 核心支持 (v2fly 无此传输), 不用 ensure_v2ray
     ensure_xray
     ensure_xray_geo_data
-    issue_certificate
+    # CDN 中转模式下 DNS-01 失败 (无 CF 凭据) 时干净中止,
+    # 不继续写到一半的配置 (直连模式申请失败走函数内的降级提示, 仍返回 0)
+    issue_certificate || { log_error "证书不可用, 本次安装中止。"; exit 1; }
 
     UUID="$(gen_uuid)"
     if ! pick_port "xhttp+tls" 8443; then
@@ -1833,7 +1954,6 @@ write_socks_config() {
   "inbounds": [
     {
       "port": ${SOCKS_PORT},
-      "listen": "0.0.0.0",
       "protocol": "socks",
       "settings": {
         "auth": "password",
@@ -2363,7 +2483,6 @@ write_reality_config() {
   "inbounds": [
     {
       "port": ${REALITY_PORT},
-      "listen": "0.0.0.0",
       "protocol": "vless",
       "settings": {
         "clients": [
@@ -2860,28 +2979,68 @@ do_show_info() {
 
 # ---------- 卸载 ----------
 
+# 从配置/nginx 文件提取端口并移出 used_ports 记录 (卸载单模式时回收端口池,
+# 否则记录只增不减, gen_port 可用池随卸载次数缩水)
+unrecord_ports_in_file() {
+    local f="$1" p n
+    [[ -f "${f}" ]] || return 0
+    for p in $(grep -oE '"port": [0-9]+' "${f}" 2>/dev/null | grep -oE '[0-9]+') \
+             $(grep -oE 'listen [0-9]+ ssl' "${f}" 2>/dev/null | grep -oE '[0-9]+'); do
+        # 上限 5 轮保险: 正常一轮即删净 (历史重复记录最多几条)
+        for n in 1 2 3 4 5; do
+            grep -qw "${p}" "${V2RAY_CONF_DIR}/used_ports.txt" 2>/dev/null || break
+            unrecord_port "${p}"
+        done
+    done
+    return 0
+}
+
 do_uninstall() {
     check_root
-    echo "当前已安装的服务:"
-    for svc in "${WS_SERVICE}" "${XHTTP_SERVICE}" "${SOCKS_SERVICE}" "${REALITY_SERVICE}" "${LEGACY_H2_SERVICE}"; do
-        if [[ -f "/etc/systemd/system/${svc}.service" ]]; then
-            local state="未运行"
-            systemctl is-active --quiet "${svc}" && state="运行中"
-            echo "  - ${svc} (${state})"
-        fi
-    done
-    echo
-    echo "请选择要卸载的模式:"
-    echo "  1. ws+tls (v2ray-ws + nginx 配置)"
-    echo "  2. xhttp+tls (xray-xhttp, 旧版为 v2ray-h2)"
-    echo "  3. socks5 (v2ray-socks)"
-    echo "  4. vless+REALITY (xray-reality)"
-    echo "  5. 全部卸载"
-    echo "  0. 返回主菜单"
-    read -rp "请选择: " choice
+    local target="${1:-}"
+    # 非交互且未指定目标: 明确提示用法 (原先静默 no-op, 容易误以为卸载成功)
+    if [[ -z "${target}" && ! -t 0 ]]; then
+        log_warn "非交互环境请指定卸载目标:"
+        log_warn "  bash install.sh uninstall ws|xhttp|socks|reality|all"
+        return 1
+    fi
+    local choice=""
+    if [[ -n "${target}" ]]; then
+        case "${target}" in
+            ws)       choice=1 ;;
+            xhttp|h2) choice=2 ;;
+            socks)    choice=3 ;;
+            reality)  choice=4 ;;
+            all)      choice=5 ;;
+            *) log_error "未知卸载目标: ${target} (可用: ws|xhttp|socks|reality|all)"; return 1 ;;
+        esac
+        log_info "卸载目标: ${target}"
+    else
+        echo "当前已安装的服务:"
+        for svc in "${WS_SERVICE}" "${XHTTP_SERVICE}" "${SOCKS_SERVICE}" "${REALITY_SERVICE}" "${LEGACY_H2_SERVICE}"; do
+            if [[ -f "/etc/systemd/system/${svc}.service" ]]; then
+                local state="未运行"
+                systemctl is-active --quiet "${svc}" && state="运行中"
+                echo "  - ${svc} (${state})"
+            fi
+        done
+        echo
+        echo "请选择要卸载的模式:"
+        echo "  1. ws+tls (v2ray-ws + nginx 配置)"
+        echo "  2. xhttp+tls (xray-xhttp, 旧版为 v2ray-h2)"
+        echo "  3. socks5 (v2ray-socks)"
+        echo "  4. vless+REALITY (xray-reality)"
+        echo "  5. 全部卸载"
+        echo "  0. 返回主菜单"
+        read -rp "请选择: " choice || return
+    fi
 
     case "${choice}" in
         1)
+            unrecord_ports_in_file "${WS_CONF}"
+            unrecord_ports_in_file "${WS_NGINX_CONF}"
+            unrecord_ports_in_file "/etc/nginx/conf.d/v2ray-ws-tls.conf"
+            unrecord_ports_in_file "${BT_NGINX_VHOST_DIR}/v2ray-ws-tls.conf"
             stop_service_sync "${WS_SERVICE}"
             systemctl disable "${WS_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${WS_SERVICE}.service" "${WS_CONF}"
@@ -2896,6 +3055,8 @@ do_uninstall() {
             ;;
         2)
             # 新旧两套都要清: xhttp 模式 (xray-xhttp) 与未迁移的旧 h2 (v2ray-h2)
+            unrecord_ports_in_file "${XHTTP_CONF}"
+            unrecord_ports_in_file "${LEGACY_H2_CONF}"
             stop_service_sync "${XHTTP_SERVICE}"
             systemctl disable "${XHTTP_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${XHTTP_SERVICE}.service" "${XHTTP_CONF}"
@@ -2907,12 +3068,14 @@ do_uninstall() {
             sed -i '/### vmess+h2/,/^$/d;/### vless+h2/,/^$/d;/### vmess+xhttp/,/^$/d;/### vless+xhttp/,/^$/d' "${INFO_FILE}" 2>/dev/null
             ;;
         3)
+            unrecord_ports_in_file "${SOCKS_CONF}"
             stop_service_sync "${SOCKS_SERVICE}"
             systemctl disable "${SOCKS_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${SOCKS_SERVICE}.service" "${SOCKS_CONF}"
             sed -i '/### socks$/,/^$/d' "${INFO_FILE}" 2>/dev/null
             ;;
         4)
+            unrecord_ports_in_file "${REALITY_CONF}"
             stop_service_sync "${REALITY_SERVICE}"
             systemctl disable "${REALITY_SERVICE}" >/dev/null 2>&1
             rm -f "/etc/systemd/system/${REALITY_SERVICE}.service" "${REALITY_CONF}"
@@ -3519,20 +3682,85 @@ do_change_reality_dest() {
 }
 
 
+# ---------- REALITY 伪装站健康巡检 (菜单 16, 只读) ----------
+# 对已装 REALITY 节点的伪装站做三项检查: TLS1.3+H2 仍达标 / 是否进了 GFW 列表 /
+# 实测 TCP 延迟。劣化时提示跑菜单 10 换站。不碰配置、不碰服务。
+do_reality_dest_check() {
+    if [[ ! -f "${REALITY_CONF}" ]]; then
+        log_warn "未安装 REALITY 模式, 无可巡检的伪装站 (可通过菜单 6 安装)。"
+        return 0
+    fi
+    local dest sni
+    dest="$(grep -o '"dest": "[^"]*"' "${REALITY_CONF}" | head -1 | cut -d'"' -f4)"
+    sni="$(grep -A1 '"serverNames"' "${REALITY_CONF}" | grep -o '"[^"]*"' | sed -n 2p | tr -d '"')"
+    [[ -z "${sni}" ]] && sni="${dest%%:*}"
+
+    echo
+    echo -e "${GREEN}========== REALITY 伪装站健康巡检 (只读) ==========${PLAIN}"
+    echo -e " 当前伪装站: ${dest}  (SNI: ${sni})"
+
+    local tls_ok=0 gfw_hit=0 ms
+    if check_reality_dest "${dest}" "${sni}"; then
+        tls_ok=1
+        echo -e " TLS1.3+H2 : ${GREEN}达标${PLAIN}"
+    else
+        echo -e " TLS1.3+H2 : ${RED}不达标 (目标站证书/协议/可达性已变化)${PLAIN}"
+    fi
+    if check_gfw_list "${sni}"; then
+        gfw_hit=1
+        echo -e " GFW 列表  : ${RED}已列入 (作 SNI 会被选择性阻断)${PLAIN}"
+    else
+        echo -e " GFW 列表  : ${GREEN}未列入${PLAIN}"
+    fi
+    ms=$( { TIMEFORMAT=%R; time timeout 5 bash -c "echo > /dev/tcp/${dest%%:*}/${dest##*:}" 2>/dev/null; } 2>&1 )
+    if [[ -n "${ms}" ]]; then
+        ms=$(awk -v t="${ms}" 'BEGIN{printf "%d", t*1000}')
+        echo -e " TCP 延迟  : ${ms}ms"
+    else
+        echo -e " TCP 延迟  : ${RED}不可达${PLAIN}"
+    fi
+
+    echo -e "${GREEN}=====================================================${PLAIN}"
+    if [[ "${tls_ok}" == "1" && "${gfw_hit}" == "0" ]]; then
+        log_confirm "巡检结论: 🟢 伪装站健康, 无需处理。"
+        return 0
+    fi
+    log_warn "巡检结论: 🔴 伪装站劣化 (TLS 不达标或已进 GFW 列表)。"
+    log_warn "建议尽快运行菜单 10 更换伪装站 (保留 UUID/端口/密钥, 客户端只改 SNI)。"
+    return 1
+}
+
 do_update_v2ray() {
     check_root
-    log_info "更新 V2Ray core..."
-    bash <(curl -L -s "${V2RAY_INSTALL_SCRIPT}")
-    log_info "更新 Xray core..."
-    bash <(curl -L -s "${XRAY_INSTALL_SCRIPT}")
-    # 官方安装脚本重跑会重新启用自带的 xray.service (跑占位 config.json),
-    # 与 ensure_xray 同样处理: 停用禁用, 只保留本脚本的 xray-reality.service
-    systemctl stop xray 2>/dev/null || true
-    systemctl disable xray >/dev/null 2>&1 || true
-    systemctl restart "${WS_SERVICE}" "${XHTTP_SERVICE}" "${SOCKS_SERVICE}" "${REALITY_SERVICE}" 2>/dev/null
+    # 只更新实际在用的内核: REALITY-only 机器不会被顺手装上 v2ray, 反之亦然
+    local have_v2ray=0 have_xray=0
+    [[ -x /usr/local/bin/v2ray ]] && have_v2ray=1
+    [[ -x /usr/local/bin/xray ]] && have_xray=1
+    if (( have_v2ray == 0 && have_xray == 0 )); then
+        log_warn "未检测到已安装的 V2Ray/Xray 内核 (未装节点?), 无可更新项。"
+        return 0
+    fi
+    if (( have_v2ray == 1 )); then
+        log_info "更新 V2Ray core..."
+        bash <(curl -L -s "${V2RAY_INSTALL_SCRIPT}")
+    fi
+    if (( have_xray == 1 )); then
+        log_info "更新 Xray core..."
+        bash <(curl -L -s "${XRAY_INSTALL_SCRIPT}")
+        # 官方安装脚本重跑会重新启用自带的 xray.service (跑占位 config.json),
+        # 与 ensure_xray 同样处理: 停用禁用, 只保留本脚本的服务
+        systemctl stop xray 2>/dev/null || true
+        systemctl disable xray >/dev/null 2>&1
+    fi
+    # 只重启 unit 实际存在的服务 (全量 restart 会打出不存在的噪音)
+    local svc svcs=()
+    for svc in "${WS_SERVICE}" "${SOCKS_SERVICE}" "${XHTTP_SERVICE}" "${REALITY_SERVICE}"; do
+        [[ -f "/etc/systemd/system/${svc}.service" ]] && svcs+=("${svc}")
+    done
+    (( ${#svcs[@]} > 0 )) && systemctl restart "${svcs[@]}" 2>/dev/null
     # 内核版本缓存作废: 刚装的就是最新版, 下次进菜单重新取一次确认
     rm -f "${V2RAY_CONF_DIR}"/core_ver_*.cache 2>/dev/null || true
-    log_info "V2Ray / Xray 已更新,相关服务已重启。"
+    log_info "内核更新完成,相关服务已重启。"
 }
 
 # ---------- 安装流程调度 ----------
@@ -3582,6 +3810,7 @@ show_menu() {
     echo -e "13. 卸载 (可选单模式或全部)"
     echo -e "14. 更新脚本 (从 GitHub 下载最新版覆盖本脚本)"
     echo -e "15. 升级已装节点配置 (保留 UUID/端口/密钥, 补齐新版功能)"
+    echo -e "16. REALITY 伪装站健康巡检 (只读)"
     echo -e " 0. 退出"
     echo
     read -rp "请选择: " choice || exit 0
@@ -3601,6 +3830,7 @@ show_menu() {
         13) do_uninstall ;;
         14) do_self_update ;;
         15) do_upgrade_nodes ;;
+        16) do_reality_dest_check ;;
         0) exit 0 ;;
         *) ;;
     esac
@@ -3627,6 +3857,7 @@ MIGRATION_STATE="${V2RAY_CONF_DIR}/migrations_done.txt"
 MIGRATIONS=(
     "1.3.0|migr_useipv4|所有模式 freedom 出站补 domainStrategy=UseIPv4"
     "1.5.0|migr_h2_to_xhttp|h2 节点迁移到 xhttp 传输 (h2 已被内核删除, 核心换 Xray)"
+    "1.6.0|migr_listen_dualstack|直连模式去掉 listen=0.0.0.0 (双栈监听, 无 IPv6 自动回退)"
 )
 
 # --- 待升级项检测 (只读, 供菜单头部提示用) ---
@@ -3648,6 +3879,16 @@ migr_h2_to_xhttp_check() {
     # 旧 h2 配置还在就说明没迁完 (迁移成功时会改名为 .migrated 备份)。
     # 即使内容已不是 h2 (迁移做到一半), 也按待升级处理, 让用户跑菜单 15 收尾。
     [[ -f "${LEGACY_H2_CONF}" ]]
+}
+
+migr_listen_dualstack_check() {
+    # 三个直连模式任一配置仍写死 0.0.0.0 即待升级; ws 内部 127.0.0.1 不在此列
+    local conf
+    for conf in "${REALITY_CONF}" "${XHTTP_CONF}" "${SOCKS_CONF}"; do
+        [[ -f "${conf}" ]] || continue
+        grep -q '"listen": "0.0.0.0"' "${conf}" && return 0
+    done
+    return 1
 }
 
 # 返回待升级条数; -1 表示本机没有已装节点 (菜单不显示该行)
@@ -3793,6 +4034,31 @@ migr_h2_to_xhttp() {
     return 0
 }
 
+# --- 迁移: 1.6.0 直连模式 listen 0.0.0.0 -> 省略 (双栈+自动回退) ---
+# 背景: 写死 0.0.0.0 让仅 IPv6 客户端不可达。省略 listen 后内核按通配地址监听:
+# Go runtime 在有 IPv6 时用 [::] 双栈 (v4-mapped), 无 IPv6 时自动回退 0.0.0.0。
+# 仅处理 reality/xhttp/socks 三个直连配置; ws 的内部 127.0.0.1 (nginx 反代) 不动。
+# 幂等: 没有 0.0.0.0 listen 行的配置直接跳过; 删除后用对应内核校验 JSON 合法。
+migr_listen_dualstack() {
+    local conf="$1" bin="$2"
+    [[ -f "${conf}" ]] || return 0
+    case "${conf}" in
+        "${REALITY_CONF}"|"${XHTTP_CONF}"|"${SOCKS_CONF}") ;;
+        *) return 0 ;;
+    esac
+    grep -q '"listen": "0.0.0.0"' "${conf}" || return 0
+    # 模板里该行处于对象中部 (带尾逗号); 兼容被手工挪到末尾 (无尾逗号) 的变体
+    sed -i '/"listen": "0.0.0.0",\?/d' "${conf}"
+    if grep -q '"listen"' "${conf}"; then
+        log_error "  ${conf}: 删除 listen 行后仍残留 listen 字段, 结构异常:"
+        grep -n '"listen"' "${conf}" | head -3
+        return 1
+    fi
+    validate_core_config "${bin}" "${conf}" || return 1
+    fix_config_perm "${conf}"
+    return 0
+}
+
 # 迁移通用执行器: 逐条检查 state, 未应用的执行, 失败回滚该条并继续报告
 do_upgrade_nodes() {
     check_root
@@ -3813,7 +4079,18 @@ do_upgrade_nodes() {
     for entry in "${MIGRATIONS[@]}"; do
         ver="${entry%%|*}"; rest="${entry#*|}"
         fn="${rest%%|*}"; desc="${rest#*|}"
+        # 跳过判定: state 已记录且 (无探针 或 探针确认无待做) 才算完成。
+        # 有 <fn>_check 探针的迁移, 即使 state 记过、探针发现条件重现
+        # (半迁移/残留) 也要重跑 —— 否则菜单头部永远红、菜单 15 却无事可做。
+        local checker="${fn}_check" need_run=1
         if grep -q "^${ver}|${fn}$" "${MIGRATION_STATE}" 2>/dev/null; then
+            if declare -F "${checker}" >/dev/null 2>&1; then
+                "${checker}" || need_run=0
+            else
+                need_run=0
+            fi
+        fi
+        if [[ "${need_run}" == "0" ]]; then
             skipped=$((skipped+1))
             continue
         fi
@@ -4168,12 +4445,16 @@ main() {
                 do_show_info
                 exit 0
                 ;;
+            checkreality)
+                do_reality_dest_check || exit 1
+                exit 0
+                ;;
             upgrade)
-                do_upgrade_nodes
+                do_upgrade_nodes || exit 1
                 exit 0
                 ;;
             uninstall)
-                do_uninstall
+                do_uninstall "${2:-}" || exit 1
                 exit 0
                 ;;
         esac

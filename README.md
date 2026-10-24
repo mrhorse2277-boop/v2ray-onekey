@@ -165,7 +165,8 @@ bash install.sh xhttp vless  # vless + xhttp + tls
 bash install.sh socks        # socks5 (随机用户名/密码, 独立端口)
 bash install.sh reality      # vless + REALITY (抗封锁首选, 免域名/证书)
 bash install.sh info         # 查看全部已安装节点并导出链接
-bash install.sh uninstall    # 卸载(可选单模式或全部)
+bash install.sh checkreality # REALITY 伪装站健康巡检 (只读)
+bash install.sh uninstall socks   # 卸载单模式 (可换 ws|xhttp|reality|all; 不带参数则交互选择)
 ```
 
 重复执行不同的安装命令即可同时安装多种模式,例如:
@@ -182,6 +183,24 @@ bash install.sh reality && bash install.sh ws vless && bash install.sh socks
 - 内置多个伪装目标站(按地区分组),安装时逐一用 TLS 1.3 + H2 探测校验并实测延迟,**自动剔除被 GFW 封锁的站点**(不在封锁列表的也经部署前终验兜底),最终选用延迟最低的可用站;菜单 10 可随时换站
 - 客户端流控为 `xtls-rprx-vision`,指纹模拟 chrome
 - 443 端口空闲时直接监听 443(伪装效果最佳);被占用时自动换独立端口
+- **菜单 16 / `bash install.sh checkreality` 健康巡检**(只读):随时复查伪装站
+  是否仍满足 TLS1.3+H2、是否被列入 GFW 封锁列表、实测延迟;劣化时提示跑
+  菜单 10 换站(保留 UUID/端口/密钥,客户端只改 SNI)
+
+### ws 模式走 Cloudflare CDN 中转(1.6.0 起)
+
+ws+tls 模式支持域名解析到 Cloudflare(橙云代理)的 CDN 中转部署,安装时
+**自动识别**(域名解析落在 CF 公布的 IP 段内即切换该模式),无需手工选:
+
+- 流量路径:客户端 → CF 边缘 → 回源本机 443(nginx),VPS 真实 IP 不直接暴露
+- 证书签发改走 **DNS-01**(`acme.sh` 的 `dns_cf`),不需要 80 端口可达:
+  - 非交互:`CF_Token=xxx CF_Account_ID=xxx CF_Zone_ID=xxx bash install.sh ws vless`
+    (或旧式 `CF_Email` + `CF_Key`);凭据仅用于本次签发,不落盘
+  - 交互模式无环境变量时会逐项询问
+  - 也可自备证书放到 `/data/v2ray.crt` 与 `/data/v2ray.key` 后安装,跳过申请
+- 安装完成后提示在 CF 面板确认 SSL/TLS 模式为 **Full (strict)**(WebSocket 现代账户默认开启)
+- 分享链接与直连 ws 完全一致,客户端无需特殊设置
+
 
 ### 端口选择
 
@@ -225,13 +244,14 @@ bash install.sh reality && bash install.sh ws vless && bash install.sh socks
 | 6 | 安装 vless + REALITY |
 | 7 | 查看全部已安装节点 / 导出全部分享链接 |
 | 8 | 手动续签 / 重新申请证书(ws/xhttp 共用) |
-| 9 | 更新 V2Ray / Xray core(全部服务一并重启) |
+| 9 | 更新 V2Ray / Xray core(**只更新实际已装的内核**;REALITY-only 机器不会被顺手装 v2ray,反之亦然) |
 | 10 | 更换 REALITY 伪装站(保留 UUID/端口,客户端只改 SNI) |
 | 11 | 重置 REALITY 节点(端口 / UUID / 密钥 / 全部) |
 | 12 | 重置 ws/xhttp/socks 节点(端口 / UUID / 用户密码) |
-| 13 | 卸载(单模式或全部) |
+| 13 | 卸载(单模式或全部;单模式卸载同时回收端口记录) |
 | 14 | 更新脚本(从 GitHub 下载最新版覆盖本地脚本,带合法性/语法校验与回滚) |
 | 15 | 升级已装节点配置(保留 UUID/端口/密钥,按序补跑新版脚本的配置迁移) |
+| 16 | REALITY 伪装站健康巡检(只读:TLS1.3+H2 / GFW 列表 / 延迟,劣化提示换站) |
 | 0 | 退出 |
 
 重置端口/安装端口支持"默认/随机/自定义"三选一(见上文端口选择)。
@@ -276,8 +296,15 @@ bash install.sh reality && bash install.sh ws vless && bash install.sh socks
 即使手工改过配置也能保证导出的链接与实际运行配置一致;导出文件
 `/root/v2ray_share_url.txt` 每次运行菜单 7 时重建,只含当前有效链接。
 
-所有模式的代理出站固定走 **IPv4**(freedom 出站 `domainStrategy: UseIPv4`),
+所有模式的代理**出站**固定走 **IPv4**(freedom 出站 `domainStrategy: UseIPv4`),
 避免 VPS 的 IPv6 回程质量不稳导致部分站点访问异常。
+
+**入站双栈监听**(1.6.0 起):socks5 / xhttp / REALITY 三个直连模式不再写死
+`listen: 0.0.0.0`,内核按通配地址监听——VPS 有 IPv6 时同时接受 IPv4 与 IPv6
+客户端连接(已实测:`[::1]` 回环 REALITY 握手与 socks 代理连通均通过,六系统
+容器矩阵全部验证),VPS 无 IPv6 时自动回退仅 IPv4,不影响原有行为。存量机器跑
+菜单 15 自动迁移。注:分享链接仍使用 IPv4 地址;VPS 具备公网 IPv6 时可手工把
+链接里的地址换成 v6 地址使用。
 
 > **xhttp 模式的客户端支持**:v2rayN 7.1.0+ / v2rayNG 1.9.10+ 可直接导入使用
 > (两者均于 2024-11 加入 xhttp)。更早的客户端不支持 xhttp,且旧的 h2 传输已被
@@ -290,6 +317,10 @@ bash install.sh reality && bash install.sh ws vless && bash install.sh socks
 现有配置(每条迁移幂等、改前备份、改后校验、失败自动回滚),完成后自动重启受影响的
 服务并重建导出链接。CLI 等价命令 `bash install.sh upgrade`。
 1.3.0 起的所有配置级变更(如出站固定 IPv4)都通过该机制向存量机器追平。
+**1.6.0 重点**:三个直连模式(socks5/xhttp/REALITY)的入站监听去掉写死的
+`listen: 0.0.0.0`,改为通配双栈监听(有 IPv6 收 v6 连接,无 IPv6 自动回退),
+已装机器跑一次菜单 15 即迁移。菜单 15 的跳过判定同时参考迁移记录与只读探针:
+即使记录显示已迁移、配置后来又出现旧残留(如手工恢复旧文件),也会重新补跑。
 
 **1.5.0 重点**:h2 传输被 Xray 内核删除,该模式迁移到 xhttp。已装 h2 的机器跑菜单 15 后,
 配置从 `config_h2.json` 转到 `config_xhttp.json`、服务从 `v2ray-h2` 换成 `xray-xhttp`
